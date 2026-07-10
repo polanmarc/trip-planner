@@ -16,12 +16,14 @@ export default function App() {
   const [tripData, setTripData] = useState(null);
   
   const [formData, setFormData] = useState({
+    origin: '',
     destination: '',
     days: 3,
     budget: 'Medio',
     style: 'Cultura y Turismo',
     companions: 'Pareja',
-    transport: 'Coche Propio / Alquiler'
+    transport: 'Coche Propio / Alquiler',
+    themes: []
   });
 
   const handleInputChange = (e) => {
@@ -29,10 +31,22 @@ export default function App() {
     setFormData(prev => ({ ...prev, [name]: value }));
   };
 
+  const handleThemeToggle = (theme) => {
+    setFormData(prev => {
+      const alreadySelected = prev.themes.includes(theme);
+      return {
+        ...prev,
+        themes: alreadySelected
+          ? prev.themes.filter((item) => item !== theme)
+          : [...prev.themes, theme]
+      };
+    });
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!formData.destination.trim()) {
-      setError('Por favor, ingresa un destino.');
+    if (!formData.origin.trim() || !formData.destination.trim()) {
+      setError('Por favor, ingresa el origen y el destino final.');
       return;
     }
     
@@ -55,7 +69,13 @@ export default function App() {
       <Navbar onLogoClick={() => setStep('form')} showNewTripButton={step === 'result'} />
       <main className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-12">
         {step === 'form' && (
-          <PlannerForm formData={formData} onChange={handleInputChange} onSubmit={handleSubmit} error={error} />
+          <PlannerForm
+            formData={formData}
+            onChange={handleInputChange}
+            onThemeToggle={handleThemeToggle}
+            onSubmit={handleSubmit}
+            error={error}
+          />
         )}
         {step === 'loading' && (
           <LoadingScreen destination={formData.destination} transport={formData.transport} />
@@ -77,7 +97,7 @@ export default function App() {
               <>
                 <LogisticsPanel transport={formData.transport} transportAdvice={tripData.transportAdvice} destination={tripData.destination} />
                 
-                <RecommendationsPanel recommendations={tripData.recommendations} />
+                <RecommendationsPanel recommendations={tripData.recommendations} siteIdeas={tripData.siteIdeas} />
               </>
             }
           />
