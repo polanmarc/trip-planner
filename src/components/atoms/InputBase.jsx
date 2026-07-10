@@ -1,6 +1,6 @@
 import React from 'react';
 
-export const InputBase = ({ name, value, onChange, placeholder, required = false, icon: Icon }) => (
+export const InputBase = ({ name, value, onChange, type = 'text', placeholder, required = false, icon: Icon }) => (
   <div className="relative">
     {Icon && (
       <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
@@ -8,7 +8,7 @@ export const InputBase = ({ name, value, onChange, placeholder, required = false
       </div>
     )}
     <input
-      type="text"
+      type={type}
       name={name}
       value={value}
       onChange={onChange}

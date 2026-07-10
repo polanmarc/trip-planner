@@ -64,11 +64,25 @@ export const PlannerForm = ({ formData, onChange, onThemeToggle, onSubmit, error
           </FormField>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-          <FormField label="Duración (Días)">
-            <NumberInputBase name="days" min="1" max="14" value={formData.days} onChange={onChange} icon={Calendar} />
+          <FormField label="Fecha de ida">
+            <InputBase
+              type="date"
+              name="departureDate"
+              value={formData.departureDate}
+              onChange={onChange}
+              icon={Calendar}
+              required
+            />
           </FormField>
-          <FormField label="Presupuesto">
-            <SelectBase name="budget" value={formData.budget} onChange={onChange} options={budgetOptions} icon={DollarSign} />
+          <FormField label="Fecha de vuelta">
+            <InputBase
+              type="date"
+              name="returnDate"
+              value={formData.returnDate}
+              onChange={onChange}
+              icon={Calendar}
+              required
+            />
           </FormField>
         </div>
         <FormField label="Medio de Transporte Principal" helperText="La IA adaptará las rutas del itinerario basándose en tu transporte.">

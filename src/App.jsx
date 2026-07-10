@@ -18,7 +18,8 @@ export default function App() {
   const [formData, setFormData] = useState({
     origin: '',
     destination: '',
-    days: 3,
+    departureDate: '',
+    returnDate: '',
     budget: 'Medio',
     style: 'Cultura y Turismo',
     companions: 'Pareja',
@@ -47,6 +48,24 @@ export default function App() {
     e.preventDefault();
     if (!formData.origin.trim() || !formData.destination.trim()) {
       setError('Por favor, ingresa el origen y el destino final.');
+      return;
+    }
+
+    if (!formData.departureDate || !formData.returnDate) {
+      setError('Por favor, selecciona la fecha de ida y la fecha de vuelta.');
+      return;
+    }
+
+    const departure = new Date(formData.departureDate);
+    const arrival = new Date(formData.returnDate);
+
+    if (Number.isNaN(departure.getTime()) || Number.isNaN(arrival.getTime())) {
+      setError('Las fechas ingresadas no son válidas. Por favor, verifica los valores.');
+      return;
+    }
+
+    if (arrival < departure) {
+      setError('La fecha de vuelta debe ser igual o posterior a la fecha de ida.');
       return;
     }
     
@@ -87,15 +106,17 @@ export default function App() {
                 destination={tripData.destination}
                 summary={tripData.summary}
                 budget={tripData.estimatedBudget}
-                days={formData.days}
+                days={tripData.days?.length || 0}
                 style={formData.style}
                 transport={formData.transport}
+                formData={formData}
+                tripData={tripData}
               />
             }
             mainContent={<DailyItineraryTimeline days={tripData.days} transportType={formData.transport} />}
             sidebarContent={
               <>
-                <LogisticsPanel transport={formData.transport} transportAdvice={tripData.transportAdvice} destination={tripData.destination} />
+                <LogisticsPanel origin={formData.origin} destination={tripData.destination} transport={formData.transport} transportAdvice={tripData.transportAdvice} />
                 
                 <RecommendationsPanel recommendations={tripData.recommendations} siteIdeas={tripData.siteIdeas} />
               </>

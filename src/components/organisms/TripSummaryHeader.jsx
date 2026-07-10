@@ -1,7 +1,13 @@
 import React from 'react';
-import { Calendar, Tag, Car, Train, Footprints } from 'lucide-react';
+import { Calendar, Tag, Car, Train, Footprints, Download } from 'lucide-react';
+import { Button } from '../atoms/Button';
+import { exportItineraryToPdf } from '../../services/pdfService';
 
-export const TripSummaryHeader = ({ destination, summary, budget, days, style, transport }) => {
+export const TripSummaryHeader = ({ destination, summary, budget, days, style, transport, formData, tripData }) => {
+  const handleExportPdf = () => {
+    exportItineraryToPdf(formData, tripData);
+  };
+
   return (
     <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 md:p-8 flex flex-col md:flex-row gap-6 justify-between items-start w-full">
       
@@ -54,6 +60,10 @@ export const TripSummaryHeader = ({ destination, summary, budget, days, style, t
             <span>Transporte: <strong className="text-slate-800">{transport}</strong></span>
           </div>
         </div>
+
+        <Button type="button" variant="secondary" className="w-full" onClick={handleExportPdf}>
+          <Download className="w-4 h-4" /> Exportar itinerario a PDF
+        </Button>
       </div>
 
     </div>

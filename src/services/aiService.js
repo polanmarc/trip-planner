@@ -1,14 +1,94 @@
 const apiKey = import.meta.env.VITE_GEMINI_API_KEY || "";
 
+const calculateTripDays = (departureDate, returnDate) => {
+  if (!departureDate || !returnDate) return 3;
+  const start = new Date(departureDate);
+  const end = new Date(returnDate);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) return 3;
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return Math.round((end - start) / msPerDay) + 1;
+};
+
 // Plan de respaldo mejorado (sin el fallo de las 30:00 horas y con soporte de precios)
 const buildFallbackTripPlan = (formData) => {
   const origin = formData.origin?.trim() || "tu origen";
   const destination = formData.destination?.trim() || "tu próximo destino";
-  const days = Number(formData.days || 3);
+  const departureDate = formData.departureDate || "";
+  const returnDate = formData.returnDate || "";
+  const days = calculateTripDays(departureDate, returnDate);
   const transport = formData.transport || "transporte principal";
   const style = formData.style || "equilibrado";
   const budget = formData.budget || "Medio";
   const selectedThemes = (formData.themes || []).length > 0 ? formData.themes : [style];
+
+  const getTravelCostEstimate = (originCity, destinationCity, transportMode) => {
+    const normalizedMode = transportMode.toLowerCase();
+
+    if (normalizedMode.includes('avión')) {
+      return `Vuelo estimado desde ${originCity} hasta ${destinationCity}: 120€ - 450€ aprox.`;
+    }
+
+    if (normalizedMode.includes('tren')) {
+      return `Tren estimado desde ${originCity} hasta ${destinationCity}: 40€ - 180€ aprox.`;
+    }
+
+    if (normalizedMode.includes('coche')) {
+      return `Carretera estimada para ${originCity} → ${destinationCity}: 80€ - 220€ en gasolina y peajes.`;
+    }
+
+    if (normalizedMode.includes('transporte público')) {
+      return `Transporte público interurbano estimado para ${originCity} → ${destinationCity}: 30€ - 90€.`;
+    }
+
+    if (normalizedMode.includes('barco') || normalizedMode.includes('ferry')) {
+      return `Ferry estimado para ${originCity} → ${destinationCity}: 80€ - 200€.`;
+    }
+
+    return `Costo estimado según el trayecto de ${originCity} a ${destinationCity} y el transporte elegido.`;
+  };
+
+  const getRouteBookingSites = (originCity, destinationCity, transportMode) => {
+    const encodedOrigin = encodeURIComponent(originCity || '');
+    const encodedDestination = encodeURIComponent(destinationCity || '');
+
+    if (transportMode.toLowerCase().includes('avión')) {
+      return [
+        { name: 'Google Flights', url: `https://www.google.com/flights?hl=es#flt=${encodedOrigin}.${encodedDestination}` },
+        { name: 'Skyscanner', url: `https://www.skyscanner.es/transport/flights/${encodedOrigin}/${encodedDestination}/` },
+        { name: 'Kayak', url: `https://www.kayak.es/vuelos/${encodedOrigin}-${encodedDestination}` }
+      ];
+    }
+
+    if (transportMode.toLowerCase().includes('tren')) {
+      return [
+        { name: 'Omio Trenes', url: `https://www.omio.es/trains/${encodedOrigin}/${encodedDestination}` },
+        { name: 'Rail Europe', url: `https://www.raileurope.com/es-es/booking/search?origin=${encodedOrigin}&destination=${encodedDestination}` },
+        { name: 'Rome2Rio', url: `https://www.rome2rio.com/s/${encodedOrigin}/${encodedDestination}` }
+      ];
+    }
+
+    if (transportMode.toLowerCase().includes('coche')) {
+      return [
+        { name: 'ViaMichelin', url: `https://www.viamichelin.es/web/Route?departure=${encodedOrigin}&arrival=${encodedDestination}` },
+        { name: 'Google Maps', url: `https://www.google.com/maps/dir/${encodedOrigin}/${encodedDestination}` },
+        { name: 'Rome2Rio', url: `https://www.rome2rio.com/s/${encodedOrigin}/${encodedDestination}` }
+      ];
+    }
+
+    if (transportMode.toLowerCase().includes('barco') || transportMode.toLowerCase().includes('ferry')) {
+      return [
+        { name: 'AFerry', url: `https://www.aferry.es/buscar.php?from=${encodedOrigin}&to=${encodedDestination}` },
+        { name: 'Rome2Rio', url: `https://www.rome2rio.com/s/${encodedOrigin}/${encodedDestination}` },
+        { name: 'Google Maps', url: `https://www.google.com/maps/dir/${encodedOrigin}/${encodedDestination}` }
+      ];
+    }
+
+    return [
+      { name: 'Omio', url: `https://www.omio.es/search/${encodedOrigin}/${encodedDestination}` },
+      { name: 'Rome2Rio', url: `https://www.rome2rio.com/s/${encodedOrigin}/${encodedDestination}` },
+      { name: 'Google Maps', url: `https://www.google.com/maps/dir/${encodedOrigin}/${encodedDestination}` }
+    ];
+  };
 
   const buildSiteIdeas = () => {
     const ideas = [];
@@ -248,8 +328,10 @@ const buildFallbackTripPlan = (formData) => {
 
   return {
     destination,
+    departureDate,
+    returnDate,
     estimatedBudget: `${budget} · estimación orientativa`,
-    summary: `Itinerario optimizado para ${destination} desde ${origin}. Diseñado para un viaje de ${days} días con un enfoque de ${style.toLowerCase()} y temáticas ${selectedThemes.join(', ').toLowerCase()}, moviéndose en ${transport.toLowerCase()}.`,
+    summary: `Itinerario optimizado para ${destination} desde ${origin}, con salida el ${departureDate} y regreso el ${returnDate}. Diseñado para ${days} días con un enfoque de ${style.toLowerCase()} y temáticas ${selectedThemes.join(', ').toLowerCase()}, moviéndose en ${transport.toLowerCase()}.`,
     days: buildDailyPlans(destination, days),
     recommendations: [
       "Reserva online con antelación para evitar colas en los monumentos más populares.",
@@ -260,11 +342,9 @@ const buildFallbackTripPlan = (formData) => {
     siteIdeas: buildSiteIdeas(),
     transportAdvice: {
       summary: `Guía práctica para trasladarte desde ${origin} hasta ${destination} usando ${transport.toLowerCase()}.`,
-      estimatedCost: "Sujeto a tarifas locales, vuelos o gasolina según la ruta",
-      bookingSites: [
-        { name: "Google Maps", url: "https://maps.google.com" },
-        { name: "Rome2Rio", url: "https://www.rome2rio.com" }
-      ]
+      travelCost: getTravelCostEstimate(origin, destination, transport),
+      estimatedCost: "Gastos principales estimados para el trayecto entre origen y destino.",
+      bookingSites: getRouteBookingSites(origin, destination, transport)
     }
   };
 };
@@ -277,6 +357,8 @@ export const generateTripPlan = async (formData) => {
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
 
+  const tripDays = calculateTripDays(formData.departureDate, formData.returnDate);
+
   // PROMPT POTENCIADO: Ahora exige lugares reales y populares según la temática, costes y horas lógicas
   const prompt = `Actúa como un guía turístico local experto y un planificador de viajes profesional de élite. 
   Tu objetivo es diseñar un itinerario de viaje 100% real, ultra-detallado y totalmente personalizado en español para el destino: ${formData.destination}.
@@ -284,7 +366,9 @@ export const generateTripPlan = async (formData) => {
   Parámetros del viaje a cumplir estrictamente:
   - Origen: ${formData.origin || 'No especificado'}.
   - Destino final: ${formData.destination}.
-  - Duración: ${formData.days} días.
+  - Ida: ${formData.departureDate || 'No especificada'}.
+  - Vuelta: ${formData.returnDate || 'No especificada'}.
+  - Duración total: ${tripDays} días.
   - Presupuesto: ${formData.budget}.
   - Estilo/Temática principal: ${formData.style}.
   - Temáticas adicionales seleccionadas: ${(formData.themes || []).join(', ') || 'Ninguna'}.
@@ -359,6 +443,7 @@ export const generateTripPlan = async (formData) => {
             type: "OBJECT",
             properties: {
               summary: { type: "STRING" },
+              travelCost: { type: "STRING" },
               estimatedCost: { type: "STRING" },
               bookingSites: {
                 type: "ARRAY",
@@ -369,7 +454,7 @@ export const generateTripPlan = async (formData) => {
                 }
               }
             },
-            required: ["summary", "estimatedCost", "bookingSites"]
+            required: ["summary", "travelCost", "estimatedCost", "bookingSites"]
           }
         },
         required: ["destination", "estimatedBudget", "summary", "days", "recommendations", "packingList", "siteIdeas", "transportAdvice"]
