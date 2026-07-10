@@ -22,6 +22,7 @@ export const DailyItineraryTimeline = ({ days, transportType }) => (
                 time={activity.time}
                 location={activity.location}
                 description={activity.description}
+                price={activity.price} // <-- LÍNEA NUEVA: Pasamos el precio a la molécula
                 transportNote={activity.transportNote}
                 transportType={transportType}
               />
