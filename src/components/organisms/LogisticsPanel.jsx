@@ -18,15 +18,7 @@ export const LogisticsPanel = ({ origin, transport, transportAdvice, destination
         <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Costo estimado</span>
         <p className="mt-2 text-sm font-semibold text-slate-900">{transportAdvice?.travelCost || transportAdvice?.estimatedCost}</p>
       </div>
-    <div className="space-y-3 mb-4">
-      <div>
-        <span className="text-xs font-semibold text-slate-400 block uppercase tracking-wider">Enlaces de reserva</span>
-        <div className="space-y-2 mt-2">
-          {transportAdvice?.bookingSites?.map((site, sIdx) => (
-            <ResourceLink key={sIdx} name={site.name} url={site.url} />
-          ))}
-        </div>
-      </div>
+    <div className="mb-4">
       <ResourceLink
         name="Ruta recomendada en Google Maps"
         url={`https://www.google.com/maps/dir/${encodeURIComponent(origin || '')}/${encodeURIComponent(destination || '')}`}
@@ -34,6 +26,6 @@ export const LogisticsPanel = ({ origin, transport, transportAdvice, destination
         variant="emerald"
       />
     </div>
-    <p className="text-sm text-slate-500">Usa los enlaces para comparar precios reales y reservar tu trayecto desde {origin} hasta {destination}.</p>
+    <p className="text-sm text-slate-500">Consulta la ruta recomendada para planificar con mayor precisión tu trayecto desde {origin} hasta {destination}.</p>
   </div>
 );

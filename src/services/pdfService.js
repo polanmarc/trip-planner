@@ -77,12 +77,6 @@ export const exportItineraryToPdf = (formData, tripData) => {
     } else if (tripData.transportAdvice.estimatedCost) {
       y = addText(doc, `Costo estimado: ${tripData.transportAdvice.estimatedCost}`, y, margin, maxWidth, 11);
     }
-    if (tripData.transportAdvice.bookingSites?.length) {
-      y = addText(doc, 'Enlaces de reserva:', y, margin, maxWidth, 11, 'bold');
-      tripData.transportAdvice.bookingSites.forEach((site) => {
-        y = addText(doc, `• ${site.name}: ${site.url}`, y, margin, maxWidth, 10);
-      });
-    }
   }
 
   if (tripData.siteIdeas && tripData.siteIdeas.length > 0) {

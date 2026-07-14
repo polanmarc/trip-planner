@@ -47,49 +47,6 @@ const buildFallbackTripPlan = (formData) => {
     return `Costo estimado según el trayecto de ${originCity} a ${destinationCity} y el transporte elegido.`;
   };
 
-  const getRouteBookingSites = (originCity, destinationCity, transportMode) => {
-    const encodedOrigin = encodeURIComponent(originCity || '');
-    const encodedDestination = encodeURIComponent(destinationCity || '');
-
-    if (transportMode.toLowerCase().includes('avión')) {
-      return [
-        { name: 'Google Flights', url: `https://www.google.com/flights?hl=es#flt=${encodedOrigin}.${encodedDestination}` },
-        { name: 'Skyscanner', url: `https://www.skyscanner.es/transport/flights/${encodedOrigin}/${encodedDestination}/` },
-        { name: 'Kayak', url: `https://www.kayak.es/vuelos/${encodedOrigin}-${encodedDestination}` }
-      ];
-    }
-
-    if (transportMode.toLowerCase().includes('tren')) {
-      return [
-        { name: 'Omio Trenes', url: `https://www.omio.es/trains/${encodedOrigin}/${encodedDestination}` },
-        { name: 'Rail Europe', url: `https://www.raileurope.com/es-es/booking/search?origin=${encodedOrigin}&destination=${encodedDestination}` },
-        { name: 'Rome2Rio', url: `https://www.rome2rio.com/s/${encodedOrigin}/${encodedDestination}` }
-      ];
-    }
-
-    if (transportMode.toLowerCase().includes('coche')) {
-      return [
-        { name: 'ViaMichelin', url: `https://www.viamichelin.es/web/Route?departure=${encodedOrigin}&arrival=${encodedDestination}` },
-        { name: 'Google Maps', url: `https://www.google.com/maps/dir/${encodedOrigin}/${encodedDestination}` },
-        { name: 'Rome2Rio', url: `https://www.rome2rio.com/s/${encodedOrigin}/${encodedDestination}` }
-      ];
-    }
-
-    if (transportMode.toLowerCase().includes('barco') || transportMode.toLowerCase().includes('ferry')) {
-      return [
-        { name: 'AFerry', url: `https://www.aferry.es/buscar.php?from=${encodedOrigin}&to=${encodedDestination}` },
-        { name: 'Rome2Rio', url: `https://www.rome2rio.com/s/${encodedOrigin}/${encodedDestination}` },
-        { name: 'Google Maps', url: `https://www.google.com/maps/dir/${encodedOrigin}/${encodedDestination}` }
-      ];
-    }
-
-    return [
-      { name: 'Omio', url: `https://www.omio.es/search/${encodedOrigin}/${encodedDestination}` },
-      { name: 'Rome2Rio', url: `https://www.rome2rio.com/s/${encodedOrigin}/${encodedDestination}` },
-      { name: 'Google Maps', url: `https://www.google.com/maps/dir/${encodedOrigin}/${encodedDestination}` }
-    ];
-  };
-
   const buildSiteIdeas = () => {
     const ideas = [];
 
@@ -343,8 +300,7 @@ const buildFallbackTripPlan = (formData) => {
     transportAdvice: {
       summary: `Guía práctica para trasladarte desde ${origin} hasta ${destination} usando ${transport.toLowerCase()}.`,
       travelCost: getTravelCostEstimate(origin, destination, transport),
-      estimatedCost: "Gastos principales estimados para el trayecto entre origen y destino.",
-      bookingSites: getRouteBookingSites(origin, destination, transport)
+      estimatedCost: "Gastos principales estimados para el trayecto entre origen y destino."
     }
   };
 };
@@ -444,17 +400,9 @@ export const generateTripPlan = async (formData) => {
             properties: {
               summary: { type: "STRING" },
               travelCost: { type: "STRING" },
-              estimatedCost: { type: "STRING" },
-              bookingSites: {
-                type: "ARRAY",
-                items: {
-                  type: "OBJECT",
-                  properties: { name: { type: "STRING" }, url: { type: "STRING" } },
-                  required: ["name", "url"]
-                }
-              }
+              estimatedCost: { type: "STRING" }
             },
-            required: ["summary", "travelCost", "estimatedCost", "bookingSites"]
+            required: ["summary", "travelCost", "estimatedCost"]
           }
         },
         required: ["destination", "estimatedBudget", "summary", "days", "recommendations", "packingList", "siteIdeas", "transportAdvice"]
