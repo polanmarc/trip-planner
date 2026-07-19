@@ -62,19 +62,25 @@ export const DailyItineraryTimeline = ({ days, transportType }) => {
             </h4>
           </div>
           <div className="p-6">
-            <div className="relative border-l-2 border-indigo-100 ml-3 md:ml-4 space-y-8">
-              {currentDay.activities.map((activity, aIdx) => (
-                <TimelineActivity
-                  key={aIdx}
-                  time={activity.time}
-                  location={activity.location}
-                  description={activity.description}
-                  price={activity.price}
-                  transportNote={activity.transportNote}
-                  transportType={transportType}
-                />
-              ))}
-            </div>
+            {Array.isArray(currentDay.activities) && currentDay.activities.length > 0 ? (
+              <div className="relative border-l-2 border-indigo-100 ml-3 md:ml-4 space-y-8">
+                {currentDay.activities.map((activity, aIdx) => (
+                  <TimelineActivity
+                    key={aIdx}
+                    time={activity.time}
+                    location={activity.location}
+                    description={activity.description}
+                    price={activity.price}
+                    transportNote={activity.transportNote}
+                    transportType={transportType}
+                  />
+                ))}
+              </div>
+            ) : (
+              <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-5 text-sm text-slate-600">
+                Aún no hay actividades disponibles para este día. Intenta generar el itinerario de nuevo para cargar el contenido completo.
+              </div>
+            )}
           </div>
         </div>
       ) : (

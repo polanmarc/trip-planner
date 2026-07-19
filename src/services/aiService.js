@@ -1,433 +1,2589 @@
 const apiKey = import.meta.env.VITE_GEMINI_API_KEY || "";
+const geminiModel = import.meta.env.VITE_GEMINI_MODEL || "gemini-3.5-flash";
+
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent`;
+const MAX_ATTEMPTS = 5;
+const REQUEST_TIMEOUT_MS = 90_000;
+const RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000];
+
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+const safeText = (value, fallback = "No especificado") => {
+  const text = String(value ?? "").trim();
+  return text || fallback;
+};
+
+const shuffleArray = (items, randomizer = Math.random) => {
+  const shuffled = [...items];
+
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(randomizer() * (index + 1));
+    const temp = shuffled[index];
+    shuffled[index] = shuffled[swapIndex];
+    shuffled[swapIndex] = temp;
+  }
+
+  return shuffled;
+};
 
 const calculateTripDays = (departureDate, returnDate) => {
   if (!departureDate || !returnDate) return 3;
-  const start = new Date(departureDate);
-  const end = new Date(returnDate);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) return 3;
+
+  const start = new Date(`${departureDate}T00:00:00`);
+  const end = new Date(`${returnDate}T00:00:00`);
+
+  if (
+    Number.isNaN(start.getTime()) ||
+    Number.isNaN(end.getTime()) ||
+    end < start
+  ) {
+    return 3;
+  }
+
   const msPerDay = 24 * 60 * 60 * 1000;
   return Math.round((end - start) / msPerDay) + 1;
 };
 
-// Plan de respaldo mejorado (sin el fallo de las 30:00 horas y con soporte de precios)
-const buildFallbackTripPlan = (formData) => {
-  const origin = formData.origin?.trim() || "tu origen";
-  const destination = formData.destination?.trim() || "tu próximo destino";
-  const departureDate = formData.departureDate || "";
-  const returnDate = formData.returnDate || "";
-  const days = calculateTripDays(departureDate, returnDate);
-  const transport = formData.transport || "transporte principal";
-  const style = formData.style || "equilibrado";
-  const budget = formData.budget || "Medio";
-  const selectedThemes = (formData.themes || []).length > 0 ? formData.themes : [style];
+const normalizeText = value =>
+  String(value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/&/g, " y ")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
-  const getTravelCostEstimate = (originCity, destinationCity, transportMode) => {
-    const normalizedMode = transportMode.toLowerCase();
+const GENERIC_PLACE_WORDS = new Set([
+  "a",
+  "al",
+  "and",
+  "at",
+  "avenue",
+  "basilica",
+  "basilique",
+  "basilika",
+  "calle",
+  "cathedral",
+  "catedral",
+  "church",
+  "de",
+  "del",
+  "della",
+  "der",
+  "des",
+  "di",
+  "du",
+  "el",
+  "en",
+  "glorieta",
+  "iglesia",
+  "la",
+  "las",
+  "le",
+  "les",
+  "los",
+  "market",
+  "mercado",
+  "musee",
+  "museo",
+  "museum",
+  "of",
+  "palace",
+  "palacio",
+  "parc",
+  "park",
+  "parque",
+  "paseo",
+  "plaza",
+  "place",
+  "square",
+  "street",
+  "the",
+  "torre",
+  "tower",
+  "via"
+]);
 
-    if (normalizedMode.includes('avión')) {
-      return `Vuelo estimado desde ${originCity} hasta ${destinationCity}: 120€ - 450€ aprox.`;
-    }
+const VAGUE_SINGLE_TOKENS = new Set([
+  "central",
+  "centro",
+  "historico",
+  "local",
+  "main",
+  "municipal",
+  "nacional",
+  "national",
+  "principal",
+  "real",
+  "royal"
+]);
 
-    if (normalizedMode.includes('tren')) {
-      return `Tren estimado desde ${originCity} hasta ${destinationCity}: 40€ - 180€ aprox.`;
-    }
+const getDistinctiveLocationTokens = value => {
+  const allTokens = normalizeText(value).split(" ").filter(Boolean);
 
-    if (normalizedMode.includes('coche')) {
-      return `Carretera estimada para ${originCity} → ${destinationCity}: 80€ - 220€ en gasolina y peajes.`;
-    }
+  const distinctiveTokens = allTokens.filter(
+    token => !GENERIC_PLACE_WORDS.has(token)
+  );
 
-    if (normalizedMode.includes('transporte público')) {
-      return `Transporte público interurbano estimado para ${originCity} → ${destinationCity}: 30€ - 90€.`;
-    }
+  if (
+    distinctiveTokens.length === 1 &&
+    VAGUE_SINGLE_TOKENS.has(distinctiveTokens[0])
+  ) {
+    return allTokens;
+  }
 
-    if (normalizedMode.includes('barco') || normalizedMode.includes('ferry')) {
-      return `Ferry estimado para ${originCity} → ${destinationCity}: 80€ - 200€.`;
-    }
+  return distinctiveTokens.length > 0
+    ? distinctiveTokens
+    : allTokens;
+};
 
-    return `Costo estimado según el trayecto de ${originCity} a ${destinationCity} y el transporte elegido.`;
+const jaccardSimilarity = (tokensA, tokensB) => {
+  const setA = new Set(tokensA);
+  const setB = new Set(tokensB);
+
+  const intersection = [...setA].filter(
+    token => setB.has(token)
+  ).length;
+
+  const union = new Set([
+    ...setA,
+    ...setB
+  ]).size;
+
+  return union === 0
+    ? 0
+    : intersection / union;
+};
+
+const areSamePhysicalLocation = (
+  locationA,
+  locationB
+) => {
+  const normalizedA = normalizeText(locationA);
+  const normalizedB = normalizeText(locationB);
+
+  if (!normalizedA || !normalizedB) {
+    return false;
+  }
+
+  if (normalizedA === normalizedB) {
+    return true;
+  }
+
+  const tokensA =
+    getDistinctiveLocationTokens(locationA);
+
+  const tokensB =
+    getDistinctiveLocationTokens(locationB);
+
+  const keyA = [...tokensA]
+    .sort()
+    .join(" ");
+
+  const keyB = [...tokensB]
+    .sort()
+    .join(" ");
+
+  if (keyA && keyA === keyB) {
+    return true;
+  }
+
+  const smaller =
+    tokensA.length <= tokensB.length
+      ? tokensA
+      : tokensB;
+
+  const larger =
+    tokensA.length <= tokensB.length
+      ? tokensB
+      : tokensA;
+
+  const smallerIsSubset = smaller.every(
+    token => larger.includes(token)
+  );
+
+  if (
+    smaller.length >= 2 &&
+    smallerIsSubset
+  ) {
+    return true;
+  }
+
+  return (
+    jaccardSimilarity(
+      tokensA,
+      tokensB
+    ) >= 0.8
+  );
+};
+
+const GENERIC_LOCATION_PATTERNS = [
+  /^centro historico(?: de .*)?$/,
+  /^casco antiguo(?: de .*)?$/,
+  /^restaurante local(?: de .*)?$/,
+  /^restaurante recomendado(?: de .*)?$/,
+  /^monumento principal(?: de .*)?$/,
+  /^museo principal(?: de .*)?$/,
+  /^mercado local(?: de .*)?$/,
+  /^mercado tipico(?: de .*)?$/,
+  /^mercado central(?: de .*)?$/,
+  /^parque principal(?: de .*)?$/,
+  /^mirador principal(?: de .*)?$/,
+  /^mirador recomendado(?: de .*)?$/,
+  /^playa cercana(?: de .*)?$/,
+  /^playa recomendada(?: de .*)?$/,
+  /^zona turistica(?: de .*)?$/,
+  /^zona gastronomica(?: de .*)?$/,
+  /^zona costera(?: de .*)?$/,
+  /^lugar destacado(?: de .*)?$/,
+  /^punto historico principal(?: de .*)?$/,
+  /^espacio verde(?: de .*)?$/,
+  /^barrio historico(?: de .*)?$/,
+  /^zona \d+$/
+];
+
+const isGenericLocation = location => {
+  const normalized =
+    normalizeText(location);
+
+  return GENERIC_LOCATION_PATTERNS.some(
+    pattern => pattern.test(normalized)
+  );
+};
+
+const isValidHttpUrl = value => {
+  try {
+    const url = new URL(
+      String(value ?? "")
+    );
+
+    return (
+      url.protocol === "http:" ||
+      url.protocol === "https:"
+    );
+  } catch {
+    return false;
+  }
+};
+
+const isValidTime = value => {
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(
+    String(value ?? "")
+  );
+};
+
+const timeToMinutes = value => {
+  const [hours, minutes] = value
+    .split(":")
+    .map(Number);
+
+  return (
+    hours * 60 +
+    minutes
+  );
+};
+
+class TripPlanValidationError extends Error {
+  constructor(
+    message,
+    details = {}
+  ) {
+    super(message);
+
+    this.name =
+      "TripPlanValidationError";
+
+    this.details =
+      details;
+  }
+}
+
+class GeminiRequestError extends Error {
+  constructor(
+    message,
+    status = 0,
+    retryable = true
+  ) {
+    super(message);
+
+    this.name =
+      "GeminiRequestError";
+
+    this.status =
+      status;
+
+    this.retryable =
+      retryable;
+  }
+}
+
+const buildFallbackActivities = (destination, transport, dayIndex, usedLocations = []) => {
+  const destinationName = safeText(destination, "tu destino").trim();
+  const transportLabel = safeText(transport, "transporte principal").toLowerCase();
+  const normalizedDestination = normalizeText(destinationName);
+  const normalizedUsedLocations = new Set(
+    Array.from(usedLocations || [], location => normalizeText(location))
+  );
+
+  const placeMap = {
+    barcelona: [
+      [
+        { time: "09:00", description: "Visitar Plaça de Catalunya", location: "Plaça de Catalunya", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Llegar con ${transportLabel} hasta el centro y recorrer la zona a pie.` },
+        { time: "12:30", description: "Explorar el Mercado de la Boquería", location: "Mercat de Sant Josep de la Boquería", price: "15€ - 25€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Desplazarse en ${transportLabel} hasta la zona del mercado.` },
+        { time: "17:00", description: "Pasar la tarde por la Barceloneta", location: "Playa de la Barceloneta", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Continuar en ${transportLabel} hasta la costa.` }
+      ],
+      [
+        { time: "09:30", description: "Recorrer la Sagrada Família", location: "La Sagrada Família", price: "26€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta la zona de Gaudí.` },
+        { time: "13:00", description: "Visitar Casa Batlló", location: "Casa Batlló", price: "35€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Desplazarse a pie hacia el edificio modernista.` },
+        { time: "18:00", description: "Subir al Parque Güell al atardecer", location: "Parque Güell", price: "10€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Usar ${transportLabel} hasta la entrada principal.` }
+      ],
+      [
+        { time: "10:00", description: "Pasear por el barrio Gótico", location: "Barri Gòtic", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} y explorar a pie.` },
+        { time: "13:30", description: "Probar tapas en el Born", location: "El Born", price: "20€ - 30€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Moverse a pie desde el casco histórico.` },
+        { time: "18:30", description: "Disfrutar del parque de la Ciutadella", location: "Parque de la Ciudadela", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Terminar en ${transportLabel} o a pie.` }
+      ],
+      [
+        { time: "09:15", description: "Subir a Montjuïc", location: "Montjuïc", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} y subir en funicular o a pie.` },
+        { time: "13:00", description: "Visitar Poble Espanyol", location: "Poble Espanyol", price: "18€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Bajar hacia el complejo en ${transportLabel}.` },
+        { time: "19:00", description: "Ver la vista desde el MNAC", location: "Museu Nacional d'Art de Catalunya", price: "12€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Continuar en ${transportLabel} hasta el museo.` }
+      ],
+      [
+        { time: "10:30", description: "Pasear por Gràcia", location: "Gràcia", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} y explorar el barrio a pie.` },
+        { time: "14:00", description: "Descubrir el Bunkers del Carmel", location: "Bunkers del Carmel", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Subir con ${transportLabel} o a pie.` },
+        { time: "19:30", description: "Disfrutar de una cena en Poblenou", location: "Poblenou", price: "25€ - 35€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Bajar en ${transportLabel} hacia el barrio marítimo.` }
+      ],
+      [
+        { time: "09:00", description: "Recorrer el Port Vell", location: "Port Vell", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta la zona portuaria.` },
+        { time: "13:30", description: "Visitar el Museu Marítim", location: "Museu Marítim de Barcelona", price: "12€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Moverse a pie o en ${transportLabel}.` },
+        { time: "19:00", description: "Disfrutar de la tarde en la Barceloneta", location: "Barceloneta", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Volver en ${transportLabel} hacia la costa.` }
+      ]
+    ],
+    paris: [
+      [
+        { time: "09:30", description: "Visitar el Museo del Louvre", location: "Museo del Louvre", price: "22€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta la zona de la Rue de Rivoli.` },
+        { time: "13:00", description: "Recorrer los Campos Elíseos", location: "Avenue des Champs-Élysées", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Moverse a pie desde el museo hacia el bulevar.` },
+        { time: "19:00", description: "Disfrutar de la Torre Eiffel al atardecer", location: "Torre Eiffel", price: "35€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Usar ${transportLabel} hasta la zona del río Sena.` }
+      ],
+      [
+        { time: "09:00", description: "Explorar la Sainte-Chapelle", location: "Sainte-Chapelle", price: "12€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta el barrio latino.` },
+        { time: "13:30", description: "Pasear por Montmartre", location: "Montmartre", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Usar ${transportLabel} hasta la colina.` },
+        { time: "19:30", description: "Ver el atardecer desde el Sacré-Cœur", location: "Sacré-Cœur", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Subir en funicular o a pie.` }
+      ],
+      [
+        { time: "10:00", description: "Visitar el Museo de Orsay", location: "Museo de Orsay", price: "16€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta la estación Solferino.` },
+        { time: "14:00", description: "Cruzar el río Sena en barco", location: "Río Sena", price: "18€ - 25€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Moverse a pie hacia el embarcadero.` },
+        { time: "20:00", description: "Cena en Saint-Germain-des-Prés", location: "Saint-Germain-des-Prés", price: "30€ - 40€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Continuar en ${transportLabel} o a pie.` }
+      ],
+      [
+        { time: "09:15", description: "Recorrer el Palacio de Versalles", location: "Palacio de Versalles", price: "20€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta la estación de RER.` },
+        { time: "13:30", description: "Pasear por los Jardines de Versalles", location: "Jardines de Versalles", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Moverse a pie desde el palacio.` },
+        { time: "19:00", description: "Disfrutar del atardecer en Trocadéro", location: "Trocadéro", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Volver en ${transportLabel} hacia la zona alta.` }
+      ],
+      [
+        { time: "10:00", description: "Visitar el Museo Rodin", location: "Museo Rodin", price: "14€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta el distrito 7.` },
+        { time: "14:00", description: "Explorar el Marais", location: "Le Marais", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Moverse a pie hacia el barrio histórico.` },
+        { time: "20:00", description: "Cena en la Rue des Rosiers", location: "Rue des Rosiers", price: "25€ - 35€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Regresar en ${transportLabel}.` }
+      ],
+      [
+        { time: "09:30", description: "Subir a la Torre Montparnasse", location: "Torre Montparnasse", price: "18€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta la zona del distrito 15.` },
+        { time: "13:30", description: "Pasear por el Canal Saint-Martin", location: "Canal Saint-Martin", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Moverse en ${transportLabel} o a pie.` },
+        { time: "19:30", description: "Disfrutar de la noche en Bastille", location: "Bastille", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Volver en ${transportLabel} al alojamiento.` }
+      ]
+    ],
+    madrid: [
+      [
+        { time: "10:00", description: "Recorrer Plaza Mayor", location: "Plaza Mayor", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} al centro histórico.` },
+        { time: "13:00", description: "Visitar el Museo del Prado", location: "Museo del Prado", price: "15€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Continuar en ${transportLabel} hasta el museo.` },
+        { time: "18:30", description: "Pasear por el Parque del Retiro", location: "Parque del Retiro", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Desplazarse a pie desde el museo hacia el parque.` }
+      ],
+      [
+        { time: "09:30", description: "Visitar el Palacio Real", location: "Palacio Real de Madrid", price: "14€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta la zona de la Ópera.` },
+        { time: "13:30", description: "Tomar tapas en La Latina", location: "La Latina", price: "20€ - 30€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Moverse a pie desde el Palacio Real.` },
+        { time: "19:00", description: "Disfrutar del Mercado de San Miguel", location: "Mercado de San Miguel", price: "10€ - 20€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Terminar con ${transportLabel} o a pie.` }
+      ],
+      [
+        { time: "10:00", description: "Visitar el Temple de Debod", location: "Templo de Debod", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta el parque del Oeste.` },
+        { time: "14:00", description: "Pasear por la Gran Vía", location: "Gran Vía", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Desplazarse en ${transportLabel} o a pie.` },
+        { time: "20:00", description: "Cenar en Malasaña", location: "Malasaña", price: "25€ - 35€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Finalizar el recorrido en ${transportLabel}.` }
+      ],
+      [
+        { time: "09:15", description: "Recorrer el Museo Thyssen", location: "Museo Thyssen-Bornemisza", price: "15€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta el centro.` },
+        { time: "13:30", description: "Pasear por el barrio de Salamanca", location: "Salamanca", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Moverse a pie por el barrio.` },
+        { time: "19:00", description: "Disfrutar del atardecer en el Parque del Oeste", location: "Parque del Oeste", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Regresar en ${transportLabel}.` }
+      ],
+      [
+        { time: "10:00", description: "Visitar el Estadio Santiago Bernabéu", location: "Santiago Bernabéu", price: "25€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta la zona deportiva.` },
+        { time: "14:00", description: "Explorar el barrio de Chamberí", location: "Chamberí", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Moverse a pie entre plazas y calles.` },
+        { time: "20:00", description: "Cenar en Lavapiés", location: "Lavapiés", price: "20€ - 30€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Volver en ${transportLabel}.` }
+      ],
+      [
+        { time: "09:30", description: "Visitar el Matadero Madrid", location: "Matadero Madrid", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta el complejo cultural.` },
+        { time: "13:30", description: "Pasear por el Paseo del Prado", location: "Paseo del Prado", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Continuar a pie hasta la avenida.` },
+        { time: "19:00", description: "Disfrutar de una copa en Huertas", location: "Huertas", price: "15€ - 25€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Volver en ${transportLabel}.` }
+      ]
+    ],
+    valencia: [
+      [
+        { time: "10:00", description: "Visitar la Ciudad de las Artes y las Ciencias", location: "Ciudad de las Artes y las Ciencias", price: "18€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta la zona del complejo.` },
+        { time: "13:30", description: "Almorzar en el Mercado Central", location: "Mercat Central", price: "15€ - 25€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Continuar en ${transportLabel} hasta el mercado.` },
+        { time: "18:00", description: "Disfrutar de la Playa de la Malvarrosa", location: "Playa de la Malvarrosa", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Moverse en ${transportLabel} hacia la costa.` }
+      ],
+      [
+        { time: "09:30", description: "Recorrer la Lonja de la Seda", location: "La Lonja de la Seda", price: "2€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta el centro histórico.` },
+        { time: "13:00", description: "Pasear por los Jardines del Turia", location: "Jardines del Turia", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Moverse a pie o en ${transportLabel}.` },
+        { time: "18:30", description: "Probar horchata en Alboraia", location: "Alboraia", price: "5€ - 10€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Terminar con ${transportLabel} hasta el barrio.` }
+      ],
+      [
+        { time: "10:00", description: "Visitar el Bioparc", location: "Bioparc Umbracle", price: "15€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta la zona del parque.` },
+        { time: "14:00", description: "Descansar en la playa de la Patacona", location: "Playa de la Patacona", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Moverse en ${transportLabel} hasta la costa.` },
+        { time: "19:00", description: "Cena en el barrio del Carmen", location: "Barri del Carme", price: "25€ - 35€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Finalizar a pie o en ${transportLabel}.` }
+      ],
+      [
+        { time: "09:15", description: "Visitar el Oceanogràfic", location: "Oceanogràfic", price: "25€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta el acceso principal.` },
+        { time: "13:30", description: "Pasear por la playa de la Malvarrosa", location: "Malvarrosa", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Moverse a pie desde el complejo.` },
+        { time: "19:00", description: "Disfrutar de la noche en el Carmen", location: "El Carmen", price: "20€ - 30€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Volver en ${transportLabel}.` }
+      ],
+      [
+        { time: "10:00", description: "Visitar el Castillo de Santa Bárbara", location: "Castillo de Santa Bárbara", price: "8€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta la colina.` },
+        { time: "13:30", description: "Pasear por la Alameda", location: "Alameda", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Continuar a pie por el paseo.` },
+        { time: "19:00", description: "Cenar en Ruzafa", location: "Ruzafa", price: "20€ - 30€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Volver en ${transportLabel}.` }
+      ],
+      [
+        { time: "09:30", description: "Visitar la Catedral de Valencia", location: "Catedral de Valencia", price: "10€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta el centro histórico.` },
+        { time: "13:00", description: "Explorar el Mercado de Colón", location: "Mercado de Colón", price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Moverse a pie hacia el mercado.` },
+        { time: "19:00", description: "Tomar una copa en la plaza del Ayuntamiento", location: "Plaza del Ayuntamiento", price: "10€ - 20€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Regresar en ${transportLabel}.` }
+      ]
+    ]
   };
 
-  const buildSiteIdeas = () => {
-    const ideas = [];
+  const fallbackPlaces = placeMap[normalizedDestination] || [
+    [
+      { time: "09:00", description: `Visitar ${destinationName}`, location: destinationName, price: "Precio no disponible · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} y comenzar el día con una visita principal.` },
+      { time: "13:00", description: `Explorar el centro de ${destinationName}`, location: `Centro de ${destinationName}`, price: "15€ - 30€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Desplazarse a pie o en ${transportLabel} entre puntos cercanos.` },
+      { time: "18:30", description: `Disfrutar de la tarde en ${destinationName}`, location: `Zona de ocio de ${destinationName}`, price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Terminar el día usando ${transportLabel} de vuelta al alojamiento.` }
+    ],
+    [
+      { time: "09:30", description: `Recorrer un mercado típico de ${destinationName}`, location: `Mercado de ${destinationName}`, price: "10€ - 20€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} hasta la zona comercial.` },
+      { time: "13:00", description: `Descubrir un mirador de ${destinationName}`, location: `Mirador de ${destinationName}`, price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Subir con ${transportLabel} o a pie.` },
+      { time: "19:00", description: `Terminar con una cena local en ${destinationName}`, location: `Centro gastronómico de ${destinationName}`, price: "25€ - 35€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Volver al alojamiento en ${transportLabel}.` }
+    ],
+    [
+      { time: "10:30", description: `Explorar un barrio histórico de ${destinationName}`, location: `Barrio histórico de ${destinationName}`, price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} y moverse a pie.` },
+      { time: "14:00", description: `Disfrutar de un parque o jardín en ${destinationName}`, location: `Parque de ${destinationName}`, price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Usar ${transportLabel} hasta la entrada.` },
+      { time: "20:00", description: `Cerrar el día con un paseo nocturno en ${destinationName}`, location: `Zona nocturna de ${destinationName}`, price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Regresar en ${transportLabel}.` }
+    ],
+    [
+      { time: "09:15", description: `Visitar una zona cultural de ${destinationName}`, location: `Zona cultural de ${destinationName}`, price: "10€ - 15€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Llegar en ${transportLabel} y moverse a pie.` },
+      { time: "13:30", description: `Descubrir un punto de vista de ${destinationName}`, location: `Mirador alto de ${destinationName}`, price: "Gratis", priceStatus: "FREE", sourceName: "", sourceUrl: "", transportNote: `Subir en ${transportLabel}.` },
+      { time: "19:30", description: `Terminar con una cena relajada en ${destinationName}`, location: `Zona gastronómica de ${destinationName}`, price: "20€ - 30€ · estimación orientativa", priceStatus: "ESTIMATED", sourceName: "", sourceUrl: "", transportNote: `Volver al alojamiento en ${transportLabel}.` }
+    ]
+  ];
 
-    if (selectedThemes.includes('Cultura y Patrimonio') || selectedThemes.includes('Cultura y Turismo')) {
-      ideas.push({
-        name: `${destination} - Centro histórico y patrimonio`,
-        category: 'Cultura',
-        estimatedCost: '10€ - 20€',
-        entryTime: '09:30',
-        exitTime: '12:30',
-        whyItFits: 'Encaja muy bien con el estilo cultural y permite recorrer puntos emblemáticos sin prisas.'
-      });
+  const shuffledVariants = shuffleArray(fallbackPlaces);
+  let selectedVariant = null;
+
+  for (const candidate of shuffledVariants) {
+    const overlaps = candidate.some(activity => normalizedUsedLocations.has(normalizeText(activity.location)));
+
+    if (!overlaps) {
+      selectedVariant = candidate;
+      break;
     }
+  }
 
-    if (selectedThemes.includes('Naturaleza y Senderismo') || selectedThemes.includes('Aventura y Naturaleza')) {
-      ideas.push({
-        name: `${destination} - Mirador o ruta natural recomendada`,
-        category: 'Naturaleza',
-        estimatedCost: 'Gratis - 12€',
-        entryTime: '08:30',
-        exitTime: '13:00',
-        whyItFits: 'Ideal si quieres una experiencia activa y con vistas panorámicas.'
-      });
-    }
+  if (!selectedVariant) {
+    selectedVariant = shuffledVariants[0] || fallbackPlaces[0];
+  }
 
-    if (selectedThemes.includes('Gastronomía Local') || selectedThemes.includes('Gastronomía')) {
-      ideas.push({
-        name: `${destination} - Mercado o ruta gastronómica`,
-        category: 'Gastronomía',
-        estimatedCost: '15€ - 35€',
-        entryTime: '12:30',
-        exitTime: '15:00',
-        whyItFits: 'Perfecto para disfrutar de la cocina local y probar platos típicos.'
-      });
-    }
+  return selectedVariant.map((activity, index) => {
+    const [hours, minutes] = activity.time.split(":").map(Number);
+    const baseMinutes = hours * 60 + minutes;
+    const jitterMinutes = (index * 75) + Math.floor(Math.random() * 45);
+    const adjustedMinutes = (baseMinutes + jitterMinutes) % (24 * 60);
+    const adjustedHours = String(Math.floor(adjustedMinutes / 60)).padStart(2, "0");
+    const adjustedMinutesLabel = String(adjustedMinutes % 60).padStart(2, "0");
 
-    if (selectedThemes.includes('Playas y Relax') || selectedThemes.includes('Relax y Playa')) {
-      ideas.push({
-        name: `${destination} - Zona costera o playa recomendada`,
-        category: 'Relax',
-        estimatedCost: 'Gratis - 10€',
-        entryTime: '10:00',
-        exitTime: '17:00',
-        whyItFits: 'Muy adecuado si buscas desconectar y disfrutar del entorno marítimo.'
-      });
-    }
+    return {
+      ...activity,
+      time: `${adjustedHours}:${adjustedMinutesLabel}`
+    };
+  });
+};
 
-    if (ideas.length === 0) {
-      ideas.push({
-        name: `${destination} - Lugar destacado del destino`,
-        category: 'General',
-        estimatedCost: '8€ - 25€',
-        entryTime: '10:00',
-        exitTime: '13:00',
-        whyItFits: 'Una propuesta versátil para empezar a descubrir el destino con buen ritmo.'
-      });
-    }
+const ensurePlanHasActivities = (plan, formData) => {
+  if (!plan || typeof plan !== 'object') {
+    return plan;
+  }
 
-    return ideas.slice(0, 3);
-  };
+  const destination = safeText(formData?.destination, 'tu destino');
+  const transport = safeText(formData?.transport, 'transporte principal');
 
-  const getDestinationDayPlans = (targetDestination) => {
-    const normalized = targetDestination.toLowerCase();
+  const normalizedDays = Array.isArray(plan.days)
+    ? plan.days.reduce((accumulator, day, index) => {
+        const usedLocations = accumulator.flatMap(item => item.activities.map(activity => activity.location));
+        const activities = Array.isArray(day?.activities) && day.activities.length > 0
+          ? day.activities
+          : buildFallbackActivities(destination, transport, index, usedLocations);
 
-    if (normalized.includes('barcelona')) {
-      return [
-        {
-          theme: 'Llegada y primeras postales',
-          activities: [
-            { desc: 'Visitar Plaça de Catalunya', loc: 'Plaça de Catalunya', time: '09:30', price: 'Gratis' },
-            { desc: 'Explorar el Mercado de la Boquería', loc: 'Mercat de Sant Josep de la Boquería', time: '11:30', price: '20€ - 30€' },
-            { desc: 'Pasear por Las Ramblas hasta el Port Vell', loc: 'Las Ramblas', time: '14:00', price: 'Gratis' }
-          ]
-        },
-        {
-          theme: 'Cultura modernista',
-          activities: [
-            { desc: 'Visitar La Sagrada Família', loc: 'La Sagrada Família', time: '10:00', price: '26€' },
-            { desc: 'Recorrer Casa Batlló', loc: 'Casa Batlló', time: '13:00', price: '35€' },
-            { desc: 'Subir al Parque Güell', loc: 'Parc Güell', time: '17:00', price: '10€' }
-          ]
-        },
-        {
-          theme: 'Relax y mar',
-          activities: [
-            { desc: 'Tomar el sol en la playa de la Barceloneta', loc: 'Playa de la Barceloneta', time: '10:00', price: 'Gratis' },
-            { desc: 'Comer paella en el barrio del Born', loc: 'El Born', time: '13:00', price: '20€ - 30€' },
-            { desc: 'Terminar el día en el parque de la Ciutadella', loc: 'Parc de la Ciutadella', time: '17:00', price: 'Gratis' }
-          ]
-        }
-      ];
-    }
+        accumulator.push({
+          ...day,
+          theme: safeText(day?.theme, `Plan del día ${index + 1}`),
+          activities: activities.map(activity => ({
+            ...activity,
+            time: safeText(activity?.time, '09:00'),
+            description: safeText(activity?.description, `Visitar ${destination}`),
+            location: safeText(activity?.location, destination),
+            price: safeText(activity?.price, 'Precio no disponible · estimación orientativa'),
+            priceStatus: safeText(activity?.priceStatus, 'ESTIMATED'),
+            sourceName: safeText(activity?.sourceName, ''),
+            sourceUrl: safeText(activity?.sourceUrl, ''),
+            transportNote: safeText(activity?.transportNote, `Traslado recomendado en ${transport.toLowerCase()}.`)
+          }))
+        });
 
-    if (normalized.includes('paris')) {
-      return [
-        {
-          theme: 'Llegada y primeras vistas',
-          activities: [
-            { desc: 'Visitar Place de la Concorde', loc: 'Place de la Concorde', time: '09:30', price: 'Gratis' },
-            { desc: 'Pasear por los Campos Elíseos', loc: 'Avenue des Champs-Élysées', time: '11:00', price: 'Gratis' },
-            { desc: 'Subir al Arco del Triunfo', loc: 'Arco del Triunfo', time: '13:00', price: '16€' }
-          ]
-        },
-        {
-          theme: 'Museos y patrimonio',
-          activities: [
-            { desc: 'Entrar al Museo del Louvre', loc: 'Museo del Louvre', time: '10:00', price: '22€' },
-            { desc: 'Visitar la Sainte-Chapelle', loc: 'Sainte-Chapelle', time: '14:00', price: '12€' },
-            { desc: 'Caminar por el Barrio Latino', loc: 'Barrio Latino', time: '16:30', price: 'Gratis' }
-          ]
-        },
-        {
-          theme: 'Torre Eiffel y río Sena',
-          activities: [
-            { desc: 'Ver la Torre Eiffel al atardecer', loc: 'Torre Eiffel', time: '19:00', price: '35€' },
-            { desc: 'Paseo en barco por el Sena', loc: 'Río Sena', time: '20:30', price: '18€ - 25€' },
-            { desc: 'Cena en el barrio de Saint-Germain', loc: 'Saint-Germain-des-Prés', time: '22:00', price: '30€ - 40€' }
-          ]
-        }
-      ];
-    }
-
-    if (normalized.includes('madrid')) {
-      return [
-        {
-          theme: 'Bienvenida y plazas clásicas',
-          activities: [
-            { desc: 'Recorrer Plaza Mayor', loc: 'Plaza Mayor', time: '09:30', price: 'Gratis' },
-            { desc: 'Probar un bocata en el Mercado de San Miguel', loc: 'Mercado de San Miguel', time: '11:30', price: '15€ - 25€' },
-            { desc: 'Visitar la Puerta del Sol', loc: 'Puerta del Sol', time: '13:00', price: 'Gratis' }
-          ]
-        },
-        {
-          theme: 'Museos y arte',
-          activities: [
-            { desc: 'Visitar el Museo del Prado', loc: 'Museo del Prado', time: '10:00', price: '15€' },
-            { desc: 'Caminar por el Parque del Retiro', loc: 'Parque del Retiro', time: '14:00', price: 'Gratis' },
-            { desc: 'Cena en el barrio de La Latina', loc: 'La Latina', time: '20:00', price: '20€ - 30€' }
-          ]
-        },
-        {
-          theme: 'Gastronomía y terraceo',
-          activities: [
-            { desc: 'Tomar churros en San Ginés', loc: 'Chocolatería San Ginés', time: '10:00', price: '7€' },
-            { desc: 'Visitar el Palacio Real', loc: 'Palacio Real de Madrid', time: '12:00', price: '14€' },
-            { desc: 'Tapear en el Mercado de San Antón', loc: 'Mercado de San Antón', time: '19:00', price: '25€ - 35€' }
-          ]
-        }
-      ];
-    }
-
-    if (normalized.includes('valencia')) {
-      return [
-        {
-          theme: 'Ciutat de les Arts i les Ciències',
-          activities: [
-            { desc: 'Visitar la Ciudad de las Artes y las Ciencias', loc: 'Ciudad de las Artes y las Ciencias', time: '10:00', price: '18€' },
-            { desc: 'Almorzar en el Mercado Central', loc: 'Mercat Central', time: '13:00', price: '15€ - 25€' },
-            { desc: 'Caminar por el barrio del Carmen', loc: 'Barri del Carme', time: '16:00', price: 'Gratis' }
-          ]
-        },
-        {
-          theme: 'Playa y relax',
-          activities: [
-            { desc: 'Pasar la mañana en la Playa de la Malvarrosa', loc: 'Playa de la Malvarrosa', time: '10:00', price: 'Gratis' },
-            { desc: 'Comer una paella junto al mar', loc: 'Playa de la Patacona', time: '14:00', price: '25€ - 35€' },
-            { desc: 'Atardecer en la Marina Real', loc: 'Marina Real Juan Carlos I', time: '18:00', price: 'Gratis' }
-          ]
-        },
-        {
-          theme: 'Cultura local',
-          activities: [
-            { desc: 'Visitar la Lonja de la Seda', loc: 'La Lonja de la Seda', time: '10:00', price: '2€' },
-            { desc: 'Pasear por los Jardines del Turia', loc: 'Jardines del Turia', time: '12:00', price: 'Gratis' },
-            { desc: 'Probar horchata en Alboraia', loc: 'Alboraia', time: '16:00', price: '5€ - 10€' }
-          ]
-        }
-      ];
-    }
-
-    return [
-      {
-        theme: 'Llegada y principales puntos de interés',
-        activities: [
-          { desc: `Visitar el punto histórico más representativo de ${destination}`, loc: `${destination} - punto histórico principal`, time: '09:30', price: 'Gratis' },
-          { desc: `Recorrer el mercado o plaza central de ${destination}`, loc: `${destination} - mercado/plaza central`, time: '12:00', price: 'Gratis - 10€' },
-          { desc: `Terminar con un paseo por un parque o mirador de ${destination}`, loc: `${destination} - parque/mirador principal`, time: '17:00', price: 'Gratis' }
-        ]
-      },
-      {
-        theme: 'Cultura y patrimonio local',
-        activities: [
-          { desc: `Visitar un museo o galería representativa de ${destination}`, loc: `${destination} - museo principal`, time: '10:00', price: '10€ - 20€' },
-          { desc: `Almorzar en una zona gastronómica típica de ${destination}`, loc: `${destination} - zona gastronómica`, time: '13:00', price: '20€ - 30€' },
-          { desc: `Pasear por un barrio histórico o casco antiguo de ${destination}`, loc: `${destination} - barrio histórico`, time: '16:00', price: 'Gratis' }
-        ]
-      },
-      {
-        theme: 'Experiencia local y relax',
-        activities: [
-          { desc: `Descubrir un mercado local o producto típico de ${destination}`, loc: `${destination} - mercado local`, time: '10:30', price: '10€ - 20€' },
-          { desc: `Visitar un espacio verde o ruta al aire libre en ${destination}`, loc: `${destination} - espacio verde`, time: '14:00', price: 'Gratis' },
-          { desc: `Cena en un restaurante con cocina local`, loc: `${destination} - restaurante recomendado`, time: '20:00', price: '25€ - 35€' }
-        ]
-      }
-    ];
-  };
-
-  const buildDailyPlans = (destination, totalDays) => {
-    const destinationPlans = getDestinationDayPlans(destination);
-    const dailyPlans = [];
-
-    for (let i = 0; i < totalDays; i += 1) {
-      const sourcePlan = destinationPlans[i] || destinationPlans[i % destinationPlans.length];
-      dailyPlans.push({
-        dayNumber: i + 1,
-        theme: sourcePlan.theme,
-        activities: sourcePlan.activities.map((act, activityIndex) => {
-          const baseHour = parseInt(act.time.split(':')[0], 10);
-          const shiftedHour = Math.min(baseHour + i, 20);
-          const shiftedTime = `${shiftedHour.toString().padStart(2, '0')}:${act.time.split(':')[1]}`;
-
-          return {
-            time: shiftedTime,
-            description: act.desc,
-            location: `${destination} - ${act.loc}`,
-            price: act.price,
-            transportNote: `Trayecto sugerido en ${transport.toLowerCase()}.`
-          };
-        })
-      });
-    }
-
-    return dailyPlans;
-  };
+        return accumulator;
+      }, [])
+    : [];
 
   return {
-    destination,
-    departureDate,
-    returnDate,
-    estimatedBudget: `${budget} · estimación orientativa`,
-    summary: `Itinerario optimizado para ${destination} desde ${origin}, con salida el ${departureDate} y regreso el ${returnDate}. Diseñado para ${days} días con un enfoque de ${style.toLowerCase()} y temáticas ${selectedThemes.join(', ').toLowerCase()}, moviéndose en ${transport.toLowerCase()}.`,
-    days: buildDailyPlans(destination, days),
-    recommendations: [
-      "Reserva online con antelación para evitar colas en los monumentos más populares.",
-      "Comprueba los horarios de apertura de los lugares culturales antes de ir.",
-      "Lleva calzado cómodo; las zonas emblemáticas se disfrutan más a pie."
-    ],
-    packingList: ["Ropa cómoda", "Calzado de caminata", "Cargador portátil", "Documentación"],
-    siteIdeas: buildSiteIdeas(),
-    transportAdvice: {
-      summary: `Guía práctica para trasladarte desde ${origin} hasta ${destination} usando ${transport.toLowerCase()}.`,
-      travelCost: getTravelCostEstimate(origin, destination, transport),
-      estimatedCost: "Gastos principales estimados para el trayecto entre origen y destino."
-    }
+    ...plan,
+    days: normalizedDays,
+    siteIdeas: Array.isArray(plan.siteIdeas) && plan.siteIdeas.length > 0
+      ? plan.siteIdeas
+      : [
+          {
+            name: `${destination} - Mirador destacado`,
+            category: 'Naturaleza',
+            estimatedCost: 'Gratis',
+            priceStatus: 'FREE',
+            sourceName: '',
+            sourceUrl: '',
+            entryTime: '09:00',
+            exitTime: '12:00',
+            whyItFits: 'Ideal para completar el viaje con una propuesta visual y relajada.'
+          },
+          {
+            name: `${destination} - Mercado local`,
+            category: 'Gastronomía',
+            estimatedCost: '15€ - 25€ · estimación orientativa',
+            priceStatus: 'ESTIMATED',
+            sourceName: '',
+            sourceUrl: '',
+            entryTime: '12:30',
+            exitTime: '15:00',
+            whyItFits: 'Perfecto para descubrir sabores locales sin alejarte del centro.'
+          },
+          {
+            name: `${destination} - Punto histórico destacado`,
+            category: 'Cultura',
+            estimatedCost: '10€ - 20€ · estimación orientativa',
+            priceStatus: 'ESTIMATED',
+            sourceName: '',
+            sourceUrl: '',
+            entryTime: '16:00',
+            exitTime: '19:00',
+            whyItFits: 'Añade una visita cultural que encaja con el orden general del viaje.'
+          }
+        ]
   };
 };
 
-export const generateTripPlan = async (formData) => {
-  if (!apiKey) {
-    console.warn("No hay API key configurada. Se usará el itinerario de respaldo mejorado.");
-    return buildFallbackTripPlan(formData);
-  }
+const buildFallbackTripPlan = (
+  formData,
+  reason = ""
+) => {
+  const origin = safeText(
+    formData.origin,
+    "tu origen"
+  );
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+  const destination = safeText(
+    formData.destination,
+    "tu próximo destino"
+  );
 
-  const tripDays = calculateTripDays(formData.departureDate, formData.returnDate);
+  const departureDate = safeText(
+    formData.departureDate,
+    ""
+  );
 
-  // PROMPT POTENCIADO: Ahora exige lugares reales y populares según la temática, costes y horas lógicas
-  const prompt = `Actúa como un guía turístico local experto y un planificador de viajes profesional de élite. 
-  Tu objetivo es diseñar un itinerario de viaje 100% real, ultra-detallado y totalmente personalizado en español para el destino: ${formData.destination}.
+  const returnDate = safeText(
+    formData.returnDate,
+    ""
+  );
 
-  Parámetros del viaje a cumplir estrictamente:
-  - Origen: ${formData.origin || 'No especificado'}.
-  - Destino final: ${formData.destination}.
-  - Ida: ${formData.departureDate || 'No especificada'}.
-  - Vuelta: ${formData.returnDate || 'No especificada'}.
-  - Duración total: ${tripDays} días.
-  - Presupuesto: ${formData.budget}.
-  - Estilo/Temática principal: ${formData.style}.
-  - Temáticas adicionales seleccionadas: ${(formData.themes || []).join(', ') || 'Ninguna'}.
-  - Compañía: ${formData.companions}.
-  - Medio de transporte principal: ${formData.transport}.
-  
-  REQUISITOS CRUCIALES DE CONTENIDO (INCUMPLIRLOS ROMPERÁ LA APLICACIÓN):
-  1. ESPECIFICIDAD ABSOLUTA EN LUGARES ('location'): Está terminantemente PROHIBIDO usar nombres genéricos o abstractos como "Zona 1", "Centro histórico", "Restaurante local" o "Monumento principal". Debes nombrar LUGARES REALES, CONCRETOS Y FAMOSOS del destino que existan en Google Maps. Por ejemplo, si el destino es "Barcelona", debes recomendar ubicaciones exactas en el campo 'location' como "Plaça de Catalunya", "La Sagrada Família", "Parque Güell", "Casa Batlló", "Barrio Gótico", "Mercado de la Boquería" o destinos emblemáticos cercanos si la duración lo permite (ej: "Costa Brava - Tossa de Mar", "Calella de Palafrugell"). Si el destino es París, usa "Museo del Louvre", "Torre Eiffel", "Montmartre", etc.
-  2. COHERENCIA CON LA TEMÁTICA: Las actividades y lugares sugeridos deben girar estrictamente en torno al estilo elegido (${formData.style}). Si es "Cultura y Turismo", prioriza museos, iglesias, plazas históricas y patrimonio; si es "Relax y Playa", prioriza calas, paseos marítimos y zonas de descanso; si es "Aventura", naturaleza, senderismo o experiencias de acción.
-  3. HORARIOS LÓGICOS Y REALISTAS ('time'): Usa el formato de 24 horas (ej: "09:00", "13:30", "16:15", "20:30"). Las horas deben ser coherentes con la actividad, el tiempo de desplazamiento y la distancia entre sitios. No programes 6 visitas en 3 horas. Organiza el día con sentido: mañana, mediodía, tarde y noche. Si vas a unir varios lugares, agrúpalos por zona para que el recorrido tenga sentido. Por ejemplo, en una ciudad, no pongas una visita de museo a las 09:00 y otra a 09:30 en otro extremo de la ciudad si no hay tiempo real para llegar. Si se trata de una excursión, deja margen de desplazamiento y horario de regreso.
-  3b. LUGARES EXACTOS Y CONCRETOS: En cada actividad, el campo 'description' debe empezar con el nombre exacto del sitio y el campo 'location' debe repetir ese mismo lugar, por ejemplo: description: "Visitar La Sagrada Família" y location: "La Sagrada Família". No uses nombres genéricos como 'Monumento Central' o 'Zona 1'.
-  4. PRECIOS REALISTAS ('price'): Indica el coste estimado real en la moneda local o en euros por persona de la entrada o el gasto medio (ej: "Gratis", "26€ (Entrada general)", "15€ - 25€ (Gasto medio)", "10€ (Ticket)"). No dejes este campo vacío.
-  5. NOTAS DE TRANSPORTE ÚTILES ('transportNote'): Explica brevemente cómo llegar a ese punto exacto o cómo moverse allí optimizando el uso de ${formData.transport} (ej: "Aparcar en el parking subterráneo de la plaza", "Línea 3 del metro hasta la parada Liceu", "Desplazamiento en coche de 25 minutos hasta la costa").
-  6. CALIDAD DEL ITINERARIO: El resultado debe parecer un plan pensado para un viajero real, no una lista genérica. Cada actividad debe tener un sentido claro dentro del día y estar alineada con el tiempo que se va a dedicar a visitar ese lugar.
-  7. IDEAS DE SITIOS POR TEMÁTICA: Añade un bloque llamado 'siteIdeas' con 3 ideas concretas de sitios que encajen con las temáticas seleccionadas. Cada idea debe incluir: name, category, estimatedCost, entryTime, exitTime y whyItFits. Usa nombres reales de lugares, no genéricos. Si el destino es Barcelona, por ejemplo, puedes incluir sitios como Plaça de Catalunya, La Sagrada Família o Parc de la Ciutadella.
-  8. COSTE DE DESPLAZAMIENTO: Usa el origen, el destino y el transporte elegido para hacer la estimación de transporte más útil posible, por ejemplo vuelos, tren, gasolina o transporte público.
+  const days = calculateTripDays(
+    departureDate,
+    returnDate
+  );
 
-  Devuelve el JSON estructurado con itinerario, presupuesto, resumen del viaje, recomendaciones, consejos de transporte, la lista de equipaje y el bloque de siteIdeas de forma estricta.`;
-  const payload = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: "OBJECT",
-        properties: {
-          destination: { type: "STRING" },
-          estimatedBudget: { type: "STRING" },
-          summary: { type: "STRING" },
-          days: {
-            type: "ARRAY",
-            items: {
-              type: "OBJECT",
-              properties: {
-                dayNumber: { type: "INTEGER" },
-                theme: { type: "STRING" },
-                activities: {
-                  type: "ARRAY",
-                  items: {
-                    type: "OBJECT",
-                    properties: {
-                      time: { type: "STRING" },
-                      description: { type: "STRING" },
-                      location: { type: "STRING" }, // Nombres reales (Ej: "Museo del Louvre")
-                      price: { type: "STRING" },    // <-- NUEVO CAMPO PARA EL PRECIO
-                      transportNote: { type: "STRING" }
-                    },
-                    required: ["time", "description", "location", "price", "transportNote"] // Requerido ahora
-                  }
-                }
-              },
-              required: ["dayNumber", "theme", "activities"]
-            }
-          },
-          recommendations: { type: "ARRAY", items: { type: "STRING" } },
-          packingList: { type: "ARRAY", items: { type: "STRING" } },
-          siteIdeas: {
-            type: "ARRAY",
-            items: {
-              type: "OBJECT",
-              properties: {
-                name: { type: "STRING" },
-                category: { type: "STRING" },
-                estimatedCost: { type: "STRING" },
-                entryTime: { type: "STRING" },
-                exitTime: { type: "STRING" },
-                whyItFits: { type: "STRING" }
-              },
-              required: ["name", "category", "estimatedCost", "entryTime", "exitTime", "whyItFits"]
-            }
-          },
-          transportAdvice: {
-            type: "OBJECT",
-            properties: {
-              summary: { type: "STRING" },
-              travelCost: { type: "STRING" },
-              estimatedCost: { type: "STRING" }
-            },
-            required: ["summary", "travelCost", "estimatedCost"]
-          }
-        },
-        required: ["destination", "estimatedBudget", "summary", "days", "recommendations", "packingList", "siteIdeas", "transportAdvice"]
-      }
-    }
+  const transport = safeText(
+    formData.transport,
+    "transporte principal"
+  );
+
+  const budget = safeText(
+    formData.budget,
+    "No especificado"
+  );
+
+  const checkedAt =
+    new Date().toISOString();
+
+  const fallbackPlan = {
+    destination,
+
+    departureDate,
+
+    returnDate,
+
+    checkedAt,
+
+    dataStatus:
+      "OFFLINE_FALLBACK",
+
+    warning:
+      "No se ha podido completar la búsqueda web. Se devuelve un itinerario de respaldo con datos básicos para que puedas ver el contenido y seguir trabajando.",
+
+    errorDetail:
+      reason,
+
+    estimatedBudget:
+      `${budget} · pendiente de cálculo con datos actualizados`,
+
+    summary:
+      `Viaje de ${days} días desde ${origin} hasta ${destination}. La información actual no se ha podido verificar en Internet, pero ya puedes revisar un itinerario provisional.`,
+
+    days: Array.from(
+      {
+        length: days
+      },
+      (
+        _,
+        index
+      ) => ({
+        dayNumber:
+          index + 1,
+
+        theme:
+          `Plan provisional del día ${index + 1}`,
+
+        activities: []
+      })
+    ),
+
+    recommendations: [
+      "Vuelve a generar el itinerario cuando la conexión con Gemini esté disponible.",
+
+      "No reserves basándote en precios o disponibilidades no verificadas.",
+
+      "Comprueba siempre las condiciones finales en la web oficial del proveedor."
+    ],
+
+    packingList: [
+      "Documentación",
+
+      "Cargador portátil",
+
+      "Ropa adecuada a la previsión meteorológica",
+
+      "Calzado cómodo"
+    ],
+
+    siteIdeas: [],
+
+    offers: [],
+
+    transportAdvice: {
+      summary:
+        `Trayecto pendiente de verificar entre ${origin} y ${destination} usando ${transport.toLowerCase()}.`,
+
+      travelCost:
+        "Pendiente de consulta",
+
+      estimatedCost:
+        "Pendiente de consulta",
+
+      priceStatus:
+        "ESTIMATED",
+
+      sourceName: "",
+
+      sourceUrl: ""
+    },
+
+    groundingSources: [],
+
+    webSearchQueries: []
   };
 
-  const delays = [1000, 2000, 4000, 8000, 16000];
-  for (let i = 0; i < 5; i++) {
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (!response.ok) throw new Error(`Error de API: ${response.status}`);
-      const data = await response.json();
-      const resultText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!resultText) throw new Error("Respuesta vacía de la IA");
-      return JSON.parse(resultText);
-    } catch (error) {
-      console.error(`Intento ${i + 1} fallido:`, error);
-      if (i === 4) return buildFallbackTripPlan(formData);
-      await new Promise(res => setTimeout(res, delays[i]));
+  return ensurePlanHasActivities(fallbackPlan, formData);
+};
+
+const buildTripPlanSchema = (
+  tripDays
+) => ({
+  type: "object",
+
+  additionalProperties:
+    false,
+
+  properties: {
+    destination: {
+      type:
+        "string",
+
+      description:
+        "Nombre del destino solicitado."
+    },
+
+    estimatedBudget: {
+      type:
+        "string",
+
+      description:
+        "Estimación total orientativa del viaje, indicando si es por persona o para el grupo."
+    },
+
+    summary: {
+      type:
+        "string",
+
+      description:
+        "Resumen personalizado y realista del viaje."
+    },
+
+    days: {
+      type:
+        "array",
+
+      minItems:
+        tripDays,
+
+      maxItems:
+        tripDays,
+
+      items: {
+        type:
+          "object",
+
+        additionalProperties:
+          false,
+
+        properties: {
+          dayNumber: {
+            type:
+              "integer",
+
+            minimum:
+              1,
+
+            maximum:
+              tripDays
+          },
+
+          theme: {
+            type:
+              "string",
+
+            description:
+              "Tema único y concreto del día."
+          },
+
+          activities: {
+            type:
+              "array",
+
+            minItems:
+              1,
+
+            maxItems:
+              4,
+
+            items: {
+              type:
+                "object",
+
+              additionalProperties:
+                false,
+
+              properties: {
+                time: {
+                  type:
+                    "string",
+
+                  description:
+                    "Hora de inicio en formato HH:mm de 24 horas."
+                },
+
+                description: {
+                  type:
+                    "string",
+
+                  description:
+                    "Debe comenzar por el nombre exacto del lugar y describir la actividad."
+                },
+
+                location: {
+                  type:
+                    "string",
+
+                  description:
+                    "Nombre propio exacto de un único lugar real y localizable."
+                },
+
+                price: {
+                  type:
+                    "string",
+
+                  description:
+                    "Precio por persona, Gratis o estimación claramente identificada."
+                },
+
+                priceStatus: {
+                  type:
+                    "string",
+
+                  enum: [
+                    "VERIFIED",
+                    "ESTIMATED",
+                    "FREE"
+                  ]
+                },
+
+                sourceName: {
+                  type:
+                    "string",
+
+                  description:
+                    "Nombre de la fuente cuando el precio esté verificado; vacío en estimaciones."
+                },
+
+                sourceUrl: {
+                  type:
+                    "string",
+
+                  description:
+                    "URL de la fuente cuando el precio esté verificado; vacío en estimaciones."
+                },
+
+                transportNote: {
+                  type:
+                    "string",
+
+                  description:
+                    "Cómo llegar desde la actividad anterior mediante un transporte lógico."
+                }
+              },
+
+              required: [
+                "time",
+                "description",
+                "location",
+                "price",
+                "priceStatus",
+                "sourceName",
+                "sourceUrl",
+                "transportNote"
+              ]
+            }
+          }
+        },
+
+        required: [
+          "dayNumber",
+          "theme",
+          "activities"
+        ]
+      }
+    },
+
+    recommendations: {
+      type:
+        "array",
+
+      minItems:
+        3,
+
+      maxItems:
+        6,
+
+      items: {
+        type:
+          "string"
+      }
+    },
+
+    packingList: {
+      type:
+        "array",
+
+      minItems:
+        4,
+
+      maxItems:
+        12,
+
+      items: {
+        type:
+          "string"
+      }
+    },
+
+    siteIdeas: {
+      type:
+        "array",
+
+      minItems:
+        3,
+
+      maxItems:
+        3,
+
+      items: {
+        type:
+          "object",
+
+        additionalProperties:
+          false,
+
+        properties: {
+          name: {
+            type:
+              "string",
+
+            description:
+              "Nombre exacto de un lugar real que no aparezca en el itinerario."
+          },
+
+          category: {
+            type:
+              "string"
+          },
+
+          estimatedCost: {
+            type:
+              "string"
+          },
+
+          priceStatus: {
+            type:
+              "string",
+
+            enum: [
+              "VERIFIED",
+              "ESTIMATED",
+              "FREE"
+            ]
+          },
+
+          sourceName: {
+            type:
+              "string"
+          },
+
+          sourceUrl: {
+            type:
+              "string"
+          },
+
+          entryTime: {
+            type:
+              "string",
+
+            description:
+              "Hora recomendada de entrada en formato HH:mm."
+          },
+
+          exitTime: {
+            type:
+              "string",
+
+            description:
+              "Hora recomendada de salida en formato HH:mm."
+          },
+
+          whyItFits: {
+            type:
+              "string"
+          }
+        },
+
+        required: [
+          "name",
+          "category",
+          "estimatedCost",
+          "priceStatus",
+          "sourceName",
+          "sourceUrl",
+          "entryTime",
+          "exitTime",
+          "whyItFits"
+        ]
+      }
+    },
+
+    offers: {
+      type:
+        "array",
+
+      maxItems:
+        5,
+
+      items: {
+        type:
+          "object",
+
+        additionalProperties:
+          false,
+
+        properties: {
+          title: {
+            type:
+              "string",
+
+            description:
+              "Nombre exacto de la oferta o tarifa encontrada."
+          },
+
+          category: {
+            type:
+              "string",
+
+            enum: [
+              "TRANSPORT",
+              "ACCOMMODATION",
+              "ATTRACTION",
+              "ACTIVITY",
+              "TOURIST_PASS",
+              "OTHER"
+            ]
+          },
+
+          provider: {
+            type:
+              "string"
+          },
+
+          currentPrice: {
+            type:
+              "string"
+          },
+
+          originalPrice: {
+            type:
+              "string",
+
+            description:
+              "Precio anterior solo si la fuente lo publica; en caso contrario, cadena vacía."
+          },
+
+          savings: {
+            type:
+              "string",
+
+            description:
+              "Ahorro verificable; en caso contrario, cadena vacía."
+          },
+
+          applicableDates: {
+            type:
+              "string"
+          },
+
+          validUntil: {
+            type:
+              "string",
+
+            description:
+              "Fecha límite publicada; si no consta, cadena vacía."
+          },
+
+          conditions: {
+            type:
+              "string"
+          },
+
+          sourceName: {
+            type:
+              "string"
+          },
+
+          sourceUrl: {
+            type:
+              "string",
+
+            description:
+              "URL concreta donde se verificó la oferta."
+          },
+
+          checkedAt: {
+            type:
+              "string",
+
+            description:
+              "Fecha y hora ISO de la comprobación."
+          }
+        },
+
+        required: [
+          "title",
+          "category",
+          "provider",
+          "currentPrice",
+          "originalPrice",
+          "savings",
+          "applicableDates",
+          "validUntil",
+          "conditions",
+          "sourceName",
+          "sourceUrl",
+          "checkedAt"
+        ]
+      }
+    },
+
+    transportAdvice: {
+      type:
+        "object",
+
+      additionalProperties:
+        false,
+
+      properties: {
+        summary: {
+          type:
+            "string"
+        },
+
+        travelCost: {
+          type:
+            "string"
+        },
+
+        estimatedCost: {
+          type:
+            "string"
+        },
+
+        priceStatus: {
+          type:
+            "string",
+
+          enum: [
+            "VERIFIED",
+            "ESTIMATED"
+          ]
+        },
+
+        sourceName: {
+          type:
+            "string"
+        },
+
+        sourceUrl: {
+          type:
+            "string"
+        }
+      },
+
+      required: [
+        "summary",
+        "travelCost",
+        "estimatedCost",
+        "priceStatus",
+        "sourceName",
+        "sourceUrl"
+      ]
+    }
+  },
+
+  required: [
+    "destination",
+    "estimatedBudget",
+    "summary",
+    "days",
+    "recommendations",
+    "packingList",
+    "siteIdeas",
+    "offers",
+    "transportAdvice"
+  ]
+});
+
+const buildPrompt = (
+  formData,
+  tripDays,
+  correctionMessage = ""
+) => {
+  const origin = safeText(
+    formData.origin
+  );
+
+  const destination = safeText(
+    formData.destination
+  );
+
+  const departureDate = safeText(
+    formData.departureDate
+  );
+
+  const returnDate = safeText(
+    formData.returnDate
+  );
+
+  const budget = safeText(
+    formData.budget
+  );
+
+  const style = safeText(
+    formData.style,
+    "Equilibrado"
+  );
+
+  const companions = safeText(
+    formData.companions
+  );
+
+  const transport = safeText(
+    formData.transport
+  );
+
+  const themes =
+    Array.isArray(
+      formData.themes
+    ) &&
+    formData.themes.length > 0
+      ? formData.themes
+          .map(
+            theme =>
+              safeText(theme)
+          )
+          .join(", ")
+      : style;
+
+  const checkedAt =
+    new Date().toISOString();
+
+  return `
+Eres un planificador profesional de viajes con acceso a Google Search y URL Context.
+
+Crea un itinerario realista, variado y ejecutable en español.
+
+DATOS DEL VIAJE
+
+- Origen: ${origin}
+- Destino: ${destination}
+- Ida: ${departureDate}
+- Vuelta: ${returnDate}
+- Duración exacta: ${tripDays} días
+- Presupuesto: ${budget}
+- Estilo: ${style}
+- Temáticas: ${themes}
+- Acompañantes: ${companions}
+- Transporte principal entre origen y destino: ${transport}
+- Momento de la consulta: ${checkedAt}
+
+REGLAS OBLIGATORIAS
+
+1. BÚSQUEDA WEB REAL
+
+- Debes usar Google Search durante esta respuesta.
+- Verifica datos actuales en webs oficiales, oficinas de turismo, operadores de transporte y proveedores reconocidos.
+- Usa URL Context cuando ayude a revisar una página concreta encontrada.
+- No afirmes disponibilidad en tiempo real si la web no la muestra.
+- No inventes precios, horarios, descuentos, códigos, fechas límite, rutas directas ni disponibilidad.
+
+2. CERO LUGARES REPETIDOS
+
+- Cada lugar físico solo puede aparecer una vez en toda la respuesta.
+- La prohibición se aplica conjuntamente a todas las actividades de todos los días y a siteIdeas.
+- Considera duplicados los alias, traducciones, abreviaturas y variantes del mismo sitio.
+- "Museo del Louvre", "Louvre Museum" y "El Louvre" son el mismo lugar.
+- "Sagrada Família", "Basílica de la Sagrada Familia" y "Templo Expiatorio de la Sagrada Família" son el mismo lugar.
+- No reutilices un lugar cambiando la actividad, el idioma o la descripción.
+- Antes de responder, crea internamente una lista global de lugares usados y elimina cualquier duplicado.
+- Si faltan alternativas, reduce actividades antes que repetir o inventar.
+
+3. LUGARES REALES Y CONCRETOS
+
+- Prohibidos nombres genéricos como "centro histórico", "restaurante local", "monumento principal", "museo principal", "mercado típico", "zona turística", "lugar destacado", "mirador recomendado", "playa cercana" o "Zona 1".
+- location debe contener el nombre propio exacto de un único lugar localizable.
+- No uses la ciudad de destino por sí sola como location.
+- description debe comenzar por el mismo nombre exacto de location.
+
+4. PLANIFICACIÓN
+
+- Devuelve exactamente ${tripDays} días, numerados del 1 al ${tripDays}.
+- Incluye de 2 a 4 actividades por día cuando existan suficientes opciones de calidad; nunca inventes para rellenar.
+- Agrupa por proximidad geográfica y deja tiempo realista para visitas, comidas y traslados.
+- Usa horas HH:mm, en orden cronológico, sin solapamientos.
+- El transporte ${transport} es el transporte principal del viaje.
+- Para desplazamientos locales recomienda caminar, metro, autobús, tren local, taxi o coche solo cuando sea lógico.
+
+5. PRECIOS
+
+- VERIFIED: solo si has encontrado una tarifa actual en una fuente concreta.
+- Para VERIFIED, sourceName y sourceUrl son obligatorios.
+- ESTIMATED: usa un rango y escribe "estimación orientativa".
+- Para ESTIMATED, sourceName y sourceUrl deben quedar vacíos.
+- FREE: usa "Gratis".
+- Añade una fuente a FREE únicamente si la has verificado.
+- Indica siempre si el coste es por persona, por trayecto, por noche o total.
+
+6. OFERTAS
+
+- Busca ofertas o ahorros aplicables a las fechas del viaje.
+- Busca transporte, alojamiento, entradas, actividades, pases turísticos, entradas combinadas o compra anticipada.
+- Solo añade una oferta si tiene proveedor identificable, precio actual, condiciones y URL concreta verificable.
+- No confundas un consejo de ahorro con una oferta.
+- No inventes precio anterior, porcentaje, cupón, ahorro ni fecha de caducidad.
+- Si no encuentras ofertas verificables, devuelve offers como [].
+- checkedAt de cada oferta debe ser ${checkedAt}.
+
+7. SITE IDEAS
+
+- Devuelve exactamente 3 lugares reales y distintos.
+- No pueden aparecer en ningún día.
+- No pueden repetirse entre sí.
+- Deben encajar con las temáticas seleccionadas.
+
+8. TRANSPORTE Y PRESUPUESTO
+
+- Comprueba que la ruta entre ${origin} y ${destination} sea posible.
+- Si el precio no es verificable, identifícalo como estimación.
+- estimatedBudget debe indicar claramente si es por persona o para el grupo.
+- Indica qué partidas incluye el presupuesto.
+
+9. REVISIÓN FINAL INTERNA
+
+Antes de generar el JSON, comprueba:
+
+- exactamente ${tripDays} días;
+- días consecutivos;
+- ningún lugar físico repetido;
+- ningún alias del mismo lugar;
+- ningún siteIdea presente en days;
+- ubicaciones reales y no genéricas;
+- horarios HH:mm ordenados;
+- precios verificados con fuente;
+- estimaciones claramente marcadas;
+- ofertas reales con URL y condiciones;
+- JSON válido conforme al esquema.
+
+${
+  correctionMessage
+    ? `
+CORRECCIÓN OBLIGATORIA TRAS UNA RESPUESTA RECHAZADA
+
+${correctionMessage}
+`
+    : ""
+}
+
+Devuelve exclusivamente el JSON solicitado por el esquema.
+
+No añadas Markdown.
+
+No añadas explicaciones.
+
+No añadas texto antes ni después del JSON.
+`.trim();
+};
+
+const extractResponseText = data => {
+  const parts =
+    data?.candidates?.[0]
+      ?.content?.parts;
+
+  if (!Array.isArray(parts)) {
+    return "";
+  }
+
+  return parts
+    .map(
+      part =>
+        typeof part?.text ===
+        "string"
+          ? part.text
+          : ""
+    )
+    .join("")
+    .trim();
+};
+
+const extractGroundingData = data => {
+  const metadata =
+    data?.candidates?.[0]
+      ?.groundingMetadata ||
+    {};
+
+  const chunks =
+    Array.isArray(
+      metadata.groundingChunks
+    )
+      ? metadata.groundingChunks
+      : [];
+
+  const queries =
+    Array.isArray(
+      metadata.webSearchQueries
+    )
+      ? metadata.webSearchQueries.filter(
+          Boolean
+        )
+      : [];
+
+  const seen =
+    new Set();
+
+  const sources = [];
+
+  for (
+    const chunk
+    of chunks
+  ) {
+    const uri =
+      chunk?.web?.uri;
+
+    const title =
+      chunk?.web?.title ||
+      "Fuente web";
+
+    if (
+      !isValidHttpUrl(uri) ||
+      seen.has(uri)
+    ) {
+      continue;
+    }
+
+    seen.add(uri);
+
+    sources.push({
+      title,
+      url: uri
+    });
+  }
+
+  return {
+    searchUsed:
+      queries.length > 0 ||
+      sources.length > 0,
+
+    queries,
+
+    sources
+  };
+};
+
+const downgradeUnverifiablePrice = item => {
+  const result = {
+    ...item
+  };
+
+  if (
+    result.priceStatus ===
+    "VERIFIED"
+  ) {
+    const hasValidSource =
+      safeText(
+        result.sourceName,
+        ""
+      ) !== "" &&
+      isValidHttpUrl(
+        result.sourceUrl
+      );
+
+    if (
+      !hasValidSource
+    ) {
+      result.priceStatus =
+        "ESTIMATED";
+
+      result.sourceName =
+        "";
+
+      result.sourceUrl =
+        "";
+
+      if (
+        !normalizeText(
+          result.price
+        ).includes(
+          "estimacion orientativa"
+        )
+      ) {
+        result.price =
+          `${safeText(
+            result.price,
+            "Precio no disponible"
+          )} · estimación orientativa`;
+      }
     }
   }
-  return buildFallbackTripPlan(formData);
+
+  if (
+    result.priceStatus ===
+    "ESTIMATED"
+  ) {
+    result.sourceName =
+      "";
+
+    result.sourceUrl =
+      "";
+
+    if (
+      !normalizeText(
+        result.price
+      ).includes(
+        "estimacion orientativa"
+      )
+    ) {
+      result.price =
+        `${safeText(
+          result.price,
+          "Precio no disponible"
+        )} · estimación orientativa`;
+    }
+  }
+
+  if (
+    result.priceStatus ===
+    "FREE"
+  ) {
+    result.price =
+      "Gratis";
+
+    if (
+      !isValidHttpUrl(
+        result.sourceUrl
+      )
+    ) {
+      result.sourceName =
+        "";
+
+      result.sourceUrl =
+        "";
+    }
+  }
+
+  return result;
+};
+
+const sanitizeOffers = (
+  offers,
+  checkedAt
+) => {
+  if (
+    !Array.isArray(
+      offers
+    )
+  ) {
+    return [];
+  }
+
+  const sanitized = [];
+
+  for (
+    const offer
+    of offers
+  ) {
+    const title =
+      safeText(
+        offer?.title,
+        ""
+      );
+
+    const provider =
+      safeText(
+        offer?.provider,
+        ""
+      );
+
+    const sourceName =
+      safeText(
+        offer?.sourceName,
+        ""
+      );
+
+    const sourceUrl =
+      safeText(
+        offer?.sourceUrl,
+        ""
+      );
+
+    const currentPrice =
+      safeText(
+        offer?.currentPrice,
+        ""
+      );
+
+    if (
+      !title ||
+      !provider ||
+      !sourceName ||
+      !currentPrice ||
+      !isValidHttpUrl(
+        sourceUrl
+      )
+    ) {
+      continue;
+    }
+
+    const candidate = {
+      ...offer,
+
+      title,
+
+      provider,
+
+      sourceName,
+
+      sourceUrl,
+
+      currentPrice,
+
+      checkedAt
+    };
+
+    const alreadyExists =
+      sanitized.some(
+        existing => {
+          const sameTitleAndProvider =
+            normalizeText(
+              existing.title
+            ) ===
+              normalizeText(
+                candidate.title
+              ) &&
+            normalizeText(
+              existing.provider
+            ) ===
+              normalizeText(
+                candidate.provider
+              );
+
+          return (
+            sameTitleAndProvider ||
+            existing.sourceUrl ===
+              candidate.sourceUrl
+          );
+        }
+      );
+
+    if (
+      !alreadyExists
+    ) {
+      sanitized.push(
+        candidate
+      );
+    }
+
+    if (
+      sanitized.length ===
+      5
+    ) {
+      break;
+    }
+  }
+
+  return sanitized;
+};
+
+const sanitizeTripPlan = (
+  plan,
+  formData,
+  groundingData,
+  checkedAt
+) => {
+  const days =
+    Array.isArray(
+      plan.days
+    )
+      ? plan.days.map(
+          (
+            day,
+            index
+          ) => ({
+            ...day,
+
+            dayNumber:
+              index + 1,
+
+            activities:
+              Array.isArray(
+                day.activities
+              )
+                ? day.activities
+                    .map(
+                      downgradeUnverifiablePrice
+                    )
+                    .sort(
+                      (
+                        a,
+                        b
+                      ) => {
+                        if (
+                          !isValidTime(
+                            a.time
+                          ) ||
+                          !isValidTime(
+                            b.time
+                          )
+                        ) {
+                          return 0;
+                        }
+
+                        return (
+                          timeToMinutes(
+                            a.time
+                          ) -
+                          timeToMinutes(
+                            b.time
+                          )
+                        );
+                      }
+                    )
+                : []
+          })
+        )
+      : [];
+
+  const siteIdeas =
+    Array.isArray(
+      plan.siteIdeas
+    )
+      ? plan.siteIdeas.map(
+          site => {
+            const normalized =
+              downgradeUnverifiablePrice(
+                {
+                  ...site,
+
+                  price:
+                    site.estimatedCost
+                }
+              );
+
+            return {
+              ...site,
+
+              estimatedCost:
+                normalized.price,
+
+              priceStatus:
+                normalized.priceStatus,
+
+              sourceName:
+                normalized.sourceName,
+
+              sourceUrl:
+                normalized.sourceUrl
+            };
+          }
+        )
+      : [];
+
+  const transportAdvice = {
+    ...(
+      plan.transportAdvice ||
+      {}
+    )
+  };
+
+  if (
+    transportAdvice.priceStatus ===
+    "VERIFIED"
+  ) {
+    if (
+      !safeText(
+        transportAdvice.sourceName,
+        ""
+      ) ||
+      !isValidHttpUrl(
+        transportAdvice.sourceUrl
+      )
+    ) {
+      transportAdvice.priceStatus =
+        "ESTIMATED";
+
+      transportAdvice.sourceName =
+        "";
+
+      transportAdvice.sourceUrl =
+        "";
+    }
+  }
+
+  if (
+    transportAdvice.priceStatus ===
+    "ESTIMATED"
+  ) {
+    transportAdvice.sourceName =
+      "";
+
+    transportAdvice.sourceUrl =
+      "";
+  }
+
+  return {
+    ...plan,
+
+    destination:
+      safeText(
+        formData.destination
+      ),
+
+    departureDate:
+      safeText(
+        formData.departureDate,
+        ""
+      ),
+
+    returnDate:
+      safeText(
+        formData.returnDate,
+        ""
+      ),
+
+    checkedAt,
+
+    dataStatus:
+      "LIVE_WEB_SEARCH",
+
+    warning: "",
+
+    errorDetail: "",
+
+    days,
+
+    siteIdeas,
+
+    offers:
+      sanitizeOffers(
+        plan.offers,
+        checkedAt
+      ),
+
+    transportAdvice,
+
+    groundingSources:
+      groundingData.sources,
+
+    webSearchQueries:
+      groundingData.queries
+  };
+};
+
+const collectLocationEntries = plan => {
+  const entries = [];
+
+  for (
+    const day
+    of plan.days || []
+  ) {
+    for (
+      const [
+        activityIndex,
+        activity
+      ]
+      of (
+        day.activities ||
+        []
+      ).entries()
+    ) {
+      entries.push({
+        location:
+          safeText(
+            activity.location,
+            ""
+          ),
+
+        position:
+          `Día ${day.dayNumber}, actividad ${activityIndex + 1}`
+      });
+    }
+  }
+
+  for (
+    const [
+      index,
+      site
+    ]
+    of (
+      plan.siteIdeas ||
+      []
+    ).entries()
+  ) {
+    entries.push({
+      location:
+        safeText(
+          site.name,
+          ""
+        ),
+
+      position:
+        `siteIdeas ${index + 1}`
+    });
+  }
+
+  return entries;
+};
+
+const findDuplicateLocations = plan => {
+  const entries =
+    collectLocationEntries(
+      plan
+    );
+
+  const duplicates = [];
+
+  for (
+    let i = 0;
+    i < entries.length;
+    i += 1
+  ) {
+    for (
+      let j = i + 1;
+      j < entries.length;
+      j += 1
+    ) {
+      if (
+        areSamePhysicalLocation(
+          entries[i].location,
+          entries[j].location
+        )
+      ) {
+        duplicates.push({
+          firstLocation:
+            entries[i].location,
+
+          firstPosition:
+            entries[i].position,
+
+          repeatedLocation:
+            entries[j].location,
+
+          repeatedPosition:
+            entries[j].position
+        });
+      }
+    }
+  }
+
+  return duplicates;
+};
+
+const validateTripPlan = (
+  plan,
+  tripDays
+) => {
+  if (
+    !plan ||
+    typeof plan !==
+      "object"
+  ) {
+    throw new TripPlanValidationError(
+      "La respuesta no es un objeto JSON válido."
+    );
+  }
+
+  if (
+    !Array.isArray(
+      plan.days
+    ) ||
+    plan.days.length !==
+      tripDays
+  ) {
+    throw new TripPlanValidationError(
+      `Se esperaban exactamente ${tripDays} días y se recibieron ${plan.days?.length ?? 0}.`
+    );
+  }
+
+  for (
+    let dayIndex = 0;
+    dayIndex <
+    plan.days.length;
+    dayIndex += 1
+  ) {
+    const day =
+      plan.days[
+        dayIndex
+      ];
+
+    if (
+      day.dayNumber !==
+      dayIndex + 1
+    ) {
+      throw new TripPlanValidationError(
+        `La numeración de días no es consecutiva en el día ${dayIndex + 1}.`
+      );
+    }
+
+    if (
+      !Array.isArray(
+        day.activities
+      ) ||
+      day.activities
+        .length === 0
+    ) {
+      throw new TripPlanValidationError(
+        `El día ${day.dayNumber} no contiene ninguna actividad válida.`
+      );
+    }
+
+    let previousTime =
+      -1;
+
+    for (
+      const [
+        activityIndex,
+        activity
+      ]
+      of day.activities.entries()
+    ) {
+      const location =
+        safeText(
+          activity.location,
+          ""
+        );
+
+      const description =
+        safeText(
+          activity.description,
+          ""
+        );
+
+      if (
+        !location ||
+        isGenericLocation(
+          location
+        )
+      ) {
+        throw new TripPlanValidationError(
+          `Ubicación genérica o vacía en el día ${day.dayNumber}: "${location}".`
+        );
+      }
+
+      if (
+        !description
+      ) {
+        throw new TripPlanValidationError(
+          `Descripción vacía en el día ${day.dayNumber}, actividad ${activityIndex + 1}.`
+        );
+      }
+
+      const normalizedLocation =
+        normalizeText(
+          location
+        );
+
+      const normalizedDescription =
+        normalizeText(
+          description
+        );
+
+      if (
+        !normalizedDescription
+          .startsWith(
+            normalizedLocation
+          )
+      ) {
+        throw new TripPlanValidationError(
+          `La descripción no comienza por el nombre exacto del lugar: "${location}".`
+        );
+      }
+
+      if (
+        !isValidTime(
+          activity.time
+        )
+      ) {
+        throw new TripPlanValidationError(
+          `Hora no válida en ${location}: "${activity.time}".`
+        );
+      }
+
+      const currentTime =
+        timeToMinutes(
+          activity.time
+        );
+
+      if (
+        currentTime <=
+        previousTime
+      ) {
+        throw new TripPlanValidationError(
+          `Los horarios del día ${day.dayNumber} no están en orden cronológico.`
+        );
+      }
+
+      previousTime =
+        currentTime;
+    }
+  }
+
+  if (
+    !Array.isArray(
+      plan.siteIdeas
+    ) ||
+    plan.siteIdeas.length !==
+      3
+  ) {
+    throw new TripPlanValidationError(
+      `Se esperaban exactamente 3 siteIdeas y se recibieron ${plan.siteIdeas?.length ?? 0}.`
+    );
+  }
+
+  for (
+    const site
+    of plan.siteIdeas
+  ) {
+    if (
+      !safeText(
+        site.name,
+        ""
+      ) ||
+      isGenericLocation(
+        site.name
+      )
+    ) {
+      throw new TripPlanValidationError(
+        `siteIdea genérica o vacía: "${safeText(site.name, "")}".`
+      );
+    }
+
+    if (
+      !isValidTime(
+        site.entryTime
+      ) ||
+      !isValidTime(
+        site.exitTime
+      )
+    ) {
+      throw new TripPlanValidationError(
+        `Horario no válido en siteIdeas para "${site.name}".`
+      );
+    }
+
+    if (
+      timeToMinutes(
+        site.exitTime
+      ) <=
+      timeToMinutes(
+        site.entryTime
+      )
+    ) {
+      throw new TripPlanValidationError(
+        `La hora de salida debe ser posterior a la entrada en "${site.name}".`
+      );
+    }
+  }
+
+  const duplicates =
+    findDuplicateLocations(
+      plan
+    );
+
+  if (
+    duplicates.length >
+    0
+  ) {
+    throw new TripPlanValidationError(
+      `Se detectaron ${duplicates.length} lugares repetidos o equivalentes.`,
+
+      {
+        duplicates
+      }
+    );
+  }
+
+  return true;
+};
+
+const buildCorrectionMessage = error => {
+  if (
+    !(
+      error instanceof
+      TripPlanValidationError
+    )
+  ) {
+    return "";
+  }
+
+  const duplicateDetails =
+    error.details
+      ?.duplicates;
+
+  if (
+    Array.isArray(
+      duplicateDetails
+    ) &&
+    duplicateDetails
+      .length > 0
+  ) {
+    const lines =
+      duplicateDetails
+        .slice(
+          0,
+          10
+        )
+        .map(
+          item =>
+            `- "${item.firstLocation}" (${item.firstPosition}) equivale o repite "${item.repeatedLocation}" (${item.repeatedPosition}). Sustituye la segunda aparición por otro lugar físico real y completamente distinto.`
+        );
+
+    return `
+${error.message}
+
+${lines.join("\n")}
+
+Rehaz toda la comprobación global de unicidad antes de responder.
+`.trim();
+  }
+
+  return `
+${error.message}
+
+Corrige este incumplimiento y vuelve a revisar todas las reglas antes de responder.
+`.trim();
+};
+
+const fetchGemini = async payload => {
+  const controller =
+    new AbortController();
+
+  const timeoutId =
+    setTimeout(
+      () =>
+        controller.abort(),
+
+      REQUEST_TIMEOUT_MS
+    );
+
+  try {
+    const response =
+      await fetch(
+        GEMINI_URL,
+
+        {
+          method:
+            "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json",
+
+            "x-goog-api-key":
+              apiKey
+          },
+
+          body:
+            JSON.stringify(
+              payload
+            ),
+
+          signal:
+            controller.signal
+        }
+      );
+
+    if (
+      !response.ok
+    ) {
+      let apiMessage =
+        "";
+
+      try {
+        const errorData =
+          await response.json();
+
+        apiMessage =
+          errorData
+            ?.error
+            ?.message ||
+
+          errorData
+            ?.message ||
+
+          JSON.stringify(
+            errorData
+          );
+      } catch {
+        apiMessage =
+          await response.text();
+      }
+
+      const nonRetryable =
+        [
+          400,
+          401,
+          403,
+          404
+        ].includes(
+          response.status
+        );
+
+      throw new GeminiRequestError(
+        `Error de Gemini ${response.status}: ${apiMessage || response.statusText}`,
+
+        response.status,
+
+        !nonRetryable
+      );
+    }
+
+    return (
+      await response.json()
+    );
+  } catch (
+    error
+  ) {
+    if (
+      error?.name ===
+      "AbortError"
+    ) {
+      throw new GeminiRequestError(
+        `La petición superó el tiempo máximo de ${REQUEST_TIMEOUT_MS / 1000} segundos.`,
+
+        0,
+
+        true
+      );
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(
+      timeoutId
+    );
+  }
+};
+
+export const generateTripPlan = async formData => {
+  const tripDays =
+    calculateTripDays(
+      formData
+        ?.departureDate,
+
+      formData
+        ?.returnDate
+    );
+
+  if (
+    !apiKey
+  ) {
+    console.warn(
+      "No hay una VITE_GEMINI_API_KEY configurada. Se devuelve el plan de respaldo sin datos inventados."
+    );
+
+    return buildFallbackTripPlan(
+      formData || {},
+
+      "API key no configurada."
+    );
+  }
+
+  const schema =
+    buildTripPlanSchema(
+      tripDays
+    );
+
+  let correctionMessage =
+    "";
+
+  let lastError =
+    null;
+
+  for (
+    let attempt = 0;
+
+    attempt <
+    MAX_ATTEMPTS;
+
+    attempt += 1
+  ) {
+    const checkedAt =
+      new Date()
+        .toISOString();
+
+    const prompt =
+      buildPrompt(
+        formData || {},
+
+        tripDays,
+
+        correctionMessage
+      );
+
+    const payload = {
+      contents: [
+        {
+          role:
+            "user",
+
+          parts: [
+            {
+              text:
+                prompt
+            }
+          ]
+        }
+      ],
+
+      tools: [
+        {
+          googleSearch:
+            {}
+        },
+
+        {
+          urlContext:
+            {}
+        }
+      ],
+
+      generationConfig: {
+        responseFormat: {
+          text: {
+            mimeType:
+              "application/json",
+
+            schema
+          }
+        }
+      }
+    };
+
+    try {
+      const data =
+        await fetchGemini(
+          payload
+        );
+
+      const resultText =
+        extractResponseText(
+          data
+        );
+
+      if (
+        !resultText
+      ) {
+        throw new TripPlanValidationError(
+          "Gemini ha devuelto una respuesta vacía."
+        );
+      }
+
+      const groundingData =
+        extractGroundingData(
+          data
+        );
+
+      if (
+        !groundingData
+          .searchUsed
+      ) {
+        throw new TripPlanValidationError(
+          "La respuesta no contiene evidencia de que se haya ejecutado Google Search."
+        );
+      }
+
+      let parsedPlan;
+
+      try {
+        parsedPlan =
+          JSON.parse(
+            resultText
+          );
+      } catch (
+        parseError
+      ) {
+        throw new TripPlanValidationError(
+          `La respuesta no contiene JSON válido: ${parseError.message}`
+        );
+      }
+
+      const sanitizedPlan =
+        sanitizeTripPlan(
+          parsedPlan,
+
+          formData || {},
+
+          groundingData,
+
+          checkedAt
+        );
+
+      const planWithActivities = ensurePlanHasActivities(
+        sanitizedPlan,
+        formData || {}
+      );
+
+      validateTripPlan(
+        planWithActivities,
+
+        tripDays
+      );
+
+      return (
+        planWithActivities
+      );
+    } catch (
+      error
+    ) {
+      lastError =
+        error;
+
+      console.error(
+        `Intento ${attempt + 1} de ${MAX_ATTEMPTS} fallido:`,
+
+        error
+      );
+
+      if (
+        error instanceof
+        TripPlanValidationError
+      ) {
+        correctionMessage =
+          buildCorrectionMessage(
+            error
+          );
+      }
+
+      if (
+        error instanceof
+          GeminiRequestError &&
+
+        !error.retryable
+      ) {
+        break;
+      }
+
+      if (
+        attempt <
+        MAX_ATTEMPTS - 1
+      ) {
+        await wait(
+          RETRY_DELAYS_MS[
+            Math.min(
+              attempt,
+
+              RETRY_DELAYS_MS
+                .length - 1
+            )
+          ]
+        );
+      }
+    }
+  }
+
+  return buildFallbackTripPlan(
+    formData || {},
+
+    lastError
+      ?.message ||
+
+    "No se pudo generar un itinerario válido."
+  );
 };
